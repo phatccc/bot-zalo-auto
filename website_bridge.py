@@ -69,6 +69,10 @@ def parse_prices(text: str) -> list[int]:
         line = re.sub(r"\([^)]*(?:\)|$)|\[[^]]*(?:\]|$)", " ", line).strip()
         # Optional `giá:` prefix and common list markers (`1. 2m8`, `• 2m8`).
         line = re.sub(r"^(?:giá|gia|price)\s*[:=-]?\s*", "", line, flags=re.I)
+        # A few sellers prefix the last value with `bo.` / `bỏ:`.  When it is
+        # immediately followed by a number it is only a stray label, not an
+        # extra account position (`Bo. 5.5` must remain one 5.5m price).
+        line = re.sub(r"^(?:bo|bỏ)\s*[.:=-]?\s*(?=\d)", "", line, flags=re.I)
         line = re.sub(r"^[#•*]\s*", "", line)
         # Do not mistake a real bare price such as `18. 6.5 3.5` for a list
         # index.  Numeric markers are removed only when the following price

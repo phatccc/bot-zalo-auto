@@ -67,6 +67,12 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
             3_000_000, 4_000_000, 5_000_000,
         ])
 
+    def test_stray_bo_prefix_before_price_does_not_shift_positions(self):
+        self.assertEqual(parse_prices("14.5 14 68\nBo. 5.5"), [
+            14_500_000, 14_000_000, 68_000_000, 5_500_000,
+        ])
+        self.assertEqual(parse_prices("bỏ: 2m8\nbay"), [2_800_000, MISSING_ACCOUNT_PRICE])
+
     def test_compact_badge_price(self):
         self.assertEqual(format_price_badge(12_500_000), "12m5")
         self.assertEqual(format_price_badge(3_100_000), "3m1")
