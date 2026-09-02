@@ -142,7 +142,9 @@ def priced_image(content: bytes, price: int) -> bytes:
         image = ImageOps.exif_transpose(source).convert("RGB")
     width, height = image.size
     label = format_price_badge(price)
-    size = max(32, min(width, height) // 7)
+    # Keep the price readable without obscuring the account details.  The badge
+    # occupies roughly the compact proportion shown in the reference image.
+    size = max(28, min(width, height) // 16)
     font = None
     for font_path in (
         "C:/Windows/Fonts/arialbd.ttf",
@@ -158,7 +160,7 @@ def priced_image(content: bytes, price: int) -> bytes:
         font = ImageFont.load_default()
     draw = ImageDraw.Draw(image, "RGBA")
     box = draw.textbbox((0, 0), label, font=font)
-    padding_x, padding_y = max(18, size // 3), max(12, size // 5)
+    padding_x, padding_y = max(12, size // 5), max(8, size // 7)
     badge_width = box[2] - box[0] + padding_x * 2
     badge_height = box[3] - box[1] + padding_y * 2
     left = (width - badge_width) // 2
