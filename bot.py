@@ -156,7 +156,6 @@ class JsonLoggerClient(ZaloAPI):
         }
         print(json.dumps(event, ensure_ascii=False, indent=2, default=str), flush=True)
         print()
-        self.progress.record_log(event)
         return_callback = None
         if self.return_images and isinstance(message, ImageGroup):
             def return_callback(images, result):

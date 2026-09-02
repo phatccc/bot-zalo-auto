@@ -15,7 +15,6 @@ class ProgressTracker:
         self._lock = threading.Lock()
         self._batches: list[dict[str, Any]] = []
         self._issues: list[dict[str, Any]] = []
-        self._logs: list[dict[str, Any]] = []
 
     def start(self, total: int, sender_name: str, main_acc: str) -> str:
         batch_id = f"{int(time.time() * 1000)}-{len(self._batches)}"
@@ -64,15 +63,9 @@ class ProgressTracker:
                 batch["issues"].insert(0, issue)
                 del batch["issues"][8:]
 
-    def record_log(self, event: dict[str, Any]) -> None:
-        entry = {"id": f"{int(time.time() * 1000)}-{len(self._logs)}", "at": time.strftime("%H:%M:%S"), "event": event}
-        with self._lock:
-            self._logs.insert(0, entry)
-            del self._logs[120:]
-
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps({"batches": self._batches, "issues": self._issues, "logs": self._logs}, ensure_ascii=False))
+            return json.loads(json.dumps({"batches": self._batches, "issues": self._issues}, ensure_ascii=False))
 
     def _find(self, batch_id: str | None) -> dict[str, Any] | None:
         return next((batch for batch in self._batches if batch["id"] == batch_id), None)
@@ -85,16 +78,15 @@ PAGE = r"""<!doctype html>
 </style><body><main class="shell"><header class="top"><div class="brand"><div class="logo">Z</div><div><p class="eyebrow">ZALO BOT / OPERATIONS</p><h1 class="title" id="title">Bảng điều khiển</h1></div></div><div class="live"><i class="dot"></i>TRỰC TUYẾN</div></header><nav class="nav" id="nav"></nav><section class="summary" id="summary"></section><section id="content"></section></main>
 <script>
 const route=location.pathname,content=document.querySelector('#content'),nav=document.querySelector('#nav'),summary=document.querySelector('#summary');let filter='active',open=new Set(),last={};
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const js=v=>esc(JSON.stringify(v,null,2));
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const issue=b=>Number(b.failed)>0||(b.issues||[]).length>0;const itemType=s=>/hoàn tất|đã cập nhật/i.test(s||'')?'ok':/lỗi|thất bại|bỏ/i.test(s||'')?'fail':'wait';
-function setNav(d){let count=(d.issues||[]).length;nav.innerHTML=`<a class="${route==='/'?'active':''}" href="/">Tiến độ</a><a class="${route==='/issues'?'active':''}" href="/issues">Đã lỗi${count?`<span class="badge">${count}</span>`:''}</a><a class="${route==='/logs'?'active':''}" href="/logs">Nhật ký</a>`}
+function setNav(d){let count=(d.issues||[]).length;nav.innerHTML=`<a class="${route==='/'?'active':''}" href="/">Tiến độ</a><a class="${route==='/issues'?'active':''}" href="/issues">Đã lỗi${count?`<span class="badge">${count}</span>`:''}</a>`}
 function setSummary(d){let b=d.batches||[],ok=b.reduce((n,x)=>n+(+x.success||0),0);summary.innerHTML=`<div class="stat"><label>BATCH ĐANG CHẠY</label><strong>${b.filter(x=>!x.done).length}</strong><small>${b.filter(x=>x.done).length} batch đã hoàn thành</small></div><div class="stat"><label>ẢNH CẬP NHẬT</label><strong>${ok}</strong><small>Tổng ảnh thành công trong phiên</small></div><div class="stat"><label>CẦN KIỂM TRA</label><strong>${(d.issues||[]).length}</strong><small>Lỗi update hoặc list bất thường</small></div>`}
 function issueCard(x){return `<article class="issue"><div class="issue-title">${esc(x.title)}</div><div class="issue-detail">${esc(x.detail)}</div><div class="issue-meta">${esc(x.at)} · ${x.severity==='warning'?'Cảnh báo':'Lỗi'}</div></article>`}
 function batchCard(b){let total=Math.max(1,+b.total||1),done=(+b.success||0)+(+b.failed||0),percent=Math.min(100,Math.round(done*100/total)),opened=open.has(b.id),issues=b.issues||[];return `<article class="batch ${b.done?'is-done':''} ${issue(b)?'has-issue':''} ${opened?'open':''}"><div class="batch-top"><div class="mark">${b.done?'✓':'↗'}</div><div class="copy"><div class="name">${esc(b.main_acc)}</div><div class="meta">Người gửi: ${esc(b.sender_name)} · ${esc(b.started_at)}</div></div><span class="state">${b.done?'Hoàn tất':'Đang chạy'}</span><button class="btn" data-open="${esc(b.id)}">${opened?'Thu gọn':'Chi tiết'}</button></div><div class="batch-body"><div class="progress"><span>${esc(b.stage)}</span><span>${done}/${total} ảnh</span></div><div class="bar"><div class="fill" style="width:${percent}%"></div></div><div class="facts"><span class="fact">${b.success||0} thành công</span>${b.failed?`<span class="fact bad">${b.failed} lỗi ảnh</span>`:''}${issues.length?`<span class="fact bad">${issues.length} cảnh báo</span>`:''}</div><div class="batch-issues">${issues.map(issueCard).join('')}</div><div class="items">${(b.items||[]).map(x=>`<div class="item ${itemType(x.stage)}"><b>Ảnh ${String(x.position).padStart(2,'0')}</b><span title="${esc(x.detail||x.stage)}">${esc(x.stage)}</span></div>`).join('')}</div></div></article>`}
 function dashboard(d){let all=d.batches||[],b=filter==='active'?all.filter(x=>!x.done):filter==='done'?all.filter(x=>x.done):all;content.innerHTML=`<div class="head"><h2>Tiến độ batch</h2><div class="filters"><button class="btn ${filter==='active'?'active':''}" data-filter="active">Đang chạy</button><button class="btn ${filter==='all'?'active':''}" data-filter="all">Tất cả</button><button class="btn ${filter==='done'?'active':''}" data-filter="done">Đã xong</button></div></div><div class="list">${b.length?b.map(batchCard).join(''):'<div class="empty"><strong>Không có batch phù hợp</strong><p>Bot đang chờ ảnh và bảng giá mới.</p></div>'}</div>`;content.querySelectorAll('[data-open]').forEach(x=>x.onclick=()=>{open.has(x.dataset.open)?open.delete(x.dataset.open):open.add(x.dataset.open);dashboard(last)});content.querySelectorAll('[data-filter]').forEach(x=>x.onclick=()=>{filter=x.dataset.filter;dashboard(last)})}
 function issues(d){let rows=d.issues||[];content.innerHTML=`<div class="head"><h2>Đã lỗi / cần kiểm tra</h2></div><div class="list">${rows.length?rows.map(issueCard).join(''):'<div class="empty"><strong>Chưa có lỗi nào</strong><p>Lỗi update hoặc list có ảnh/giá bất thường sẽ hiện tại đây.</p></div>'}</div>`}
-function logs(d){let rows=d.logs||[];content.innerHTML=`<div class="head"><h2>Nhật ký JSON</h2></div><div class="list">${rows.length?rows.map(x=>{let e=x.event||{};return `<details class="log"><summary><span class="time">${esc(x.at)}</span><span class="log-name">${esc(e.event||e.message_type||'Sự kiện')} · ${esc(e.sender?.name||'Không rõ')}</span><span>⌄</span></summary><pre>${js(e)}</pre></details>`}).join(''):'<div class="empty"><strong>Chưa có nhật ký</strong><p>Event Zalo mới sẽ tự xuất hiện tại đây.</p></div>'}</div>`}
-function render(d){last=d;setNav(d);setSummary(d);document.querySelector('#title').textContent=route==='/issues'?'Đã lỗi / cần kiểm tra':route==='/logs'?'Nhật ký JSON':'Bảng điều khiển';route==='/issues'?issues(d):route==='/logs'?logs(d):dashboard(d)}async function load(){try{let r=await fetch('/api/progress',{cache:'no-store'});if(!r.ok)throw Error();render(await r.json())}catch{content.innerHTML='<div class="empty"><strong>Không đọc được tiến độ</strong><p>Bot có thể vừa khởi động lại. Trang sẽ tự thử lại.</p></div>'}}load();setInterval(load,800);
+function render(d){last=d;setNav(d);setSummary(d);document.querySelector('#title').textContent=route==='/issues'?'Đã lỗi / cần kiểm tra':'Bảng điều khiển';route==='/issues'?issues(d):dashboard(d)}async function load(){try{let r=await fetch('/api/progress',{cache:'no-store'});if(!r.ok)throw Error();render(await r.json())}catch{content.innerHTML='<div class="empty"><strong>Không đọc được tiến độ</strong><p>Bot có thể vừa khởi động lại. Trang sẽ tự thử lại.</p></div>'}}load();setInterval(load,800);
 </script></body></html>"""
 
 
@@ -115,7 +107,7 @@ def start_dashboard(tracker: ProgressTracker, settings: dict[str, Any]) -> str |
                 content = json.dumps(tracker.snapshot(), ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
-            elif path in ("/", "/index.html", "/issues", "/logs"):
+            elif path in ("/", "/index.html", "/issues"):
                 content = PAGE.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
