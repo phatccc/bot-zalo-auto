@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import threading
 import time
@@ -146,6 +147,56 @@ def retry(action: Callable[[], Any], label: str) -> Any:
             break
     suffix = " sau 3 lần" if attempt == 3 else ""
     raise RuntimeError(f"{label} thất bại{suffix}: {error}")
+
+
+IMAGE_HASH_BITS = 16
+IMAGE_HASH_DISTANCE_LIMIT = 30
+
+
+def _difference_hash(image: Image.Image) -> str:
+    """Return a 256-bit dHash; resilient to JPEG recompression and resizing."""
+    reduced = ImageOps.grayscale(image).resize((IMAGE_HASH_BITS + 1, IMAGE_HASH_BITS), Image.Resampling.LANCZOS)
+    pixels = list(reduced.get_flattened_data())
+    value = 0
+    for row in range(IMAGE_HASH_BITS):
+        offset = row * (IMAGE_HASH_BITS + 1)
+        for column in range(IMAGE_HASH_BITS):
+            value = (value << 1) | (pixels[offset + column] > pixels[offset + column + 1])
+    return f"{value:0{IMAGE_HASH_BITS * IMAGE_HASH_BITS // 4}x}"
+
+
+def image_signature(content: bytes) -> str:
+    """Hash four border regions, intentionally excluding the centred price badge."""
+    with Image.open(io.BytesIO(content)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+    width, height = image.size
+    # The bot places the price in the centre.  Top, bottom, and side strips stay
+    # stable even when the same account image arrives again with a price pasted on.
+    crops = (
+        (0, 0, width, max(1, int(height * 0.28))),
+        (0, max(0, int(height * 0.72)), width, height),
+        (0, int(height * 0.20), max(1, int(width * 0.28)), max(1, int(height * 0.80))),
+        (max(0, int(width * 0.72)), int(height * 0.20), width, max(1, int(height * 0.80))),
+    )
+    return json.dumps({"v": 1, "h": [_difference_hash(image.crop(box)) for box in crops]}, separators=(",", ":"))
+
+
+def signature_similarity(candidate: str, stored: str) -> int | None:
+    """Return confidence 0-100 for compatible image signatures, else None."""
+    try:
+        candidate_hashes = json.loads(candidate).get("h", [])
+        stored_hashes = json.loads(stored).get("h", [])
+        if len(candidate_hashes) != 4 or len(stored_hashes) != 4:
+            return None
+        distances = [(int(left, 16) ^ int(right, 16)).bit_count() for left, right in zip(candidate_hashes, stored_hashes)]
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    # One edge may be cropped by a sender.  Compare the three most stable sides
+    # instead of allowing a centre badge or minor crop to reject a true match.
+    average_distance = sum(sorted(distances)[:3]) / 3
+    if average_distance > IMAGE_HASH_DISTANCE_LIMIT:
+        return None
+    return round(100 * (1 - average_distance / (IMAGE_HASH_BITS * IMAGE_HASH_BITS)))
 
 
 def priced_image(content: bytes, price: int, max_dimension: int = 1920) -> bytes:
@@ -293,6 +344,42 @@ class WebsiteBridge:
             if row.get("title") and row.get("id")
         }
 
+    def find_owner_by_image(self, source_url: str) -> dict[str, Any] | None:
+        """Match a priced/unpriced image against stored perceptual hashes."""
+        required = ("supabase_url", "supabase_service_key")
+        if any(not self.settings.get(key) for key in required):
+            raise RuntimeError("Thiếu cấu hình Supabase để tìm chủ acc.")
+        session = self._http()
+        response = session.get(source_url, timeout=60)
+        response.raise_for_status()
+        candidate = image_signature(response.content)
+        base = str(self.settings["supabase_url"]).rstrip("/") + "/rest/v1"
+        response = session.get(
+            f"{base}/accounts",
+            params={
+                "select": "id,title,main_acc,image_hash",
+                "image_hash": "not.is.null",
+                "limit": "1000",
+                "order": "id.desc",
+            },
+            headers=self._headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        best: dict[str, Any] | None = None
+        for row in response.json():
+            confidence = signature_similarity(candidate, str(row.get("image_hash") or ""))
+            if confidence is None:
+                continue
+            if best is None or confidence > best["confidence"]:
+                best = {
+                    "account_id": row.get("id"),
+                    "title": row.get("title"),
+                    "main_acc": row.get("main_acc") or "(chưa có tên chủ)",
+                    "confidence": confidence,
+                }
+        return best
+
     def _upload_and_store(self, base: str, source_url: str, price: int, title: str, main_acc: str, owner: str | None, batch_id: str, position: int, existing_id: str | None, lookup_per_item: bool) -> bytes:
         session = self._http()
 
@@ -303,6 +390,9 @@ class WebsiteBridge:
             return response.content
 
         original = retry(download_original, f"Ảnh {title}")
+        # Save a watermark-tolerant fingerprint of the original alongside the
+        # account.  `/timchu` later compares its untouched border regions.
+        image_hash = image_signature(original)
         try:
             return_size = int(self.settings.get("return_image_max_dimension", 1920))
         except (TypeError, ValueError):
@@ -340,7 +430,7 @@ class WebsiteBridge:
         upload = retry(upload_image, f"Upload ảnh {title}")
         image_url = upload.json()["secure_url"]
         self.progress.update_item(batch_id, position, "Đang lưu dữ liệu web")
-        row = {"price": str(price), "description": DESCRIPTION, "image_url": image_url, "main_acc": main_acc}
+        row = {"price": str(price), "description": DESCRIPTION, "image_url": image_url, "main_acc": main_acc, "image_hash": image_hash}
         if owner:
             row["owner"] = owner
         if lookup_per_item:

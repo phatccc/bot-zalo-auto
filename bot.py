@@ -8,7 +8,7 @@ from pathlib import Path
 import requests
 from zlapi import ImageGroup, ZaloAPI
 from zlapi.models import Message, ThreadType
-from website_bridge import WebsiteBridge
+from website_bridge import WebsiteBridge, image_urls
 from progress_dashboard import ProgressTracker, start_dashboard
 
 
@@ -77,8 +77,10 @@ class JsonLoggerClient(ZaloAPI):
         self.website_bridge = WebsiteBridge(website, progress)
         self.return_images = return_images
         self.return_executor = ThreadPoolExecutor(max_workers=1)
+        self.owner_search_executor = ThreadPoolExecutor(max_workers=1)
         self.returned_groups = set()
         self.returning_threads = {}
+        self.owner_search_requests = {}
 
     def return_image_group(self, author_id, group_id, images, thread_id, thread_type, notification=None):
         """Send price-labelled images only after their web update succeeded."""
@@ -130,6 +132,34 @@ class JsonLoggerClient(ZaloAPI):
         except Exception:
             return "(không rõ)"
 
+    def _start_owner_search(self, author_id, thread_id, thread_type):
+        destination = str(self.website_bridge.settings.get("notification_chat_id") or "").strip()
+        if not destination or str(author_id) != destination:
+            self.send(Message(text="Lệnh /timchu chỉ dùng cho chủ bot."), thread_id, thread_type)
+            return
+        self.owner_search_requests[(str(author_id), str(thread_id))] = time.monotonic() + 180
+        self.send(Message(text="🔎 Gửi 1 ảnh cần tìm chủ acc trong 3 phút."), thread_id, thread_type)
+
+    def _find_owner_from_image(self, image_url, destination):
+        try:
+            result = self.website_bridge.find_owner_by_image(image_url)
+            if result:
+                text = (
+                    "🔎 Kết quả /timchu\n"
+                    f"Chủ acc: {result['main_acc']}\n"
+                    f"Mã acc: {result['title']}\n"
+                    f"Độ khớp ảnh: {result['confidence']}%"
+                )
+            else:
+                text = (
+                    "Không tìm thấy chủ acc phù hợp.\n"
+                    "Ảnh chỉ tìm được nếu account đã được bot cập nhật sau khi có image_hash."
+                )
+        except Exception as error:
+            text = f"Không thể tìm chủ acc: {error}"
+            self.progress.record_issue("/timchu thất bại", str(error))
+        self.send(Message(text=text), destination, ThreadType.USER)
+
     def onMessage(self, mid, author_id, message, message_object, thread_id, thread_type):
         pending_return = self.returning_threads.get(str(thread_id))
         if isinstance(message, ImageGroup) and pending_return and pending_return[0] > time.monotonic() and len(message.images) == pending_return[1]:
@@ -156,6 +186,19 @@ class JsonLoggerClient(ZaloAPI):
         }
         print(json.dumps(event, ensure_ascii=False, indent=2, default=str), flush=True)
         print()
+        search_key = (str(author_id), str(thread_id))
+        if isinstance(message, str) and message.strip().casefold() == "/timchu":
+            self._start_owner_search(author_id, thread_id, thread_type)
+            return
+        expires_at = self.owner_search_requests.get(search_key)
+        urls = image_urls(message)
+        if expires_at and expires_at <= time.monotonic():
+            self.owner_search_requests.pop(search_key, None)
+        elif expires_at and urls:
+            self.owner_search_requests.pop(search_key, None)
+            destination = str(self.website_bridge.settings.get("notification_chat_id") or "").strip()
+            self.owner_search_executor.submit(self._find_owner_from_image, urls[0], destination)
+            return
         return_callback = None
         if self.return_images and isinstance(message, ImageGroup):
             def return_callback(images, result):

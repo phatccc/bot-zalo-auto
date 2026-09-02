@@ -2,10 +2,10 @@ import io
 import unittest
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 import requests
 
-from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, parse_prices, priced_image, raised_price, retry
+from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, image_signature, parse_prices, priced_image, raised_price, retry, signature_similarity
 
 
 class PriceParserTests(unittest.TestCase):
@@ -73,6 +73,22 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
                 retry(bad_request, "ảnh test")
         self.assertEqual(len(attempts), 1)
         sleep.assert_not_called()
+
+    def test_image_signature_survives_centred_price_badge(self):
+        source = Image.new("RGB", (900, 600), "black")
+        draw = ImageDraw.Draw(source)
+        for offset in range(0, 900, 45):
+            draw.rectangle((offset, 0, offset + 22, 599), fill=(offset % 255, (offset * 3) % 255, (offset * 7) % 255))
+        raw = io.BytesIO()
+        source.save(raw, format="JPEG", quality=92)
+        original_signature = image_signature(raw.getvalue())
+        labelled_signature = image_signature(priced_image(raw.getvalue(), 76_000_000))
+        confidence = signature_similarity(labelled_signature, original_signature)
+        self.assertIsNotNone(confidence)
+        self.assertGreaterEqual(confidence, 90)
+
+    def test_invalid_image_signature_never_matches(self):
+        self.assertIsNone(signature_similarity("not-json", "also-not-json"))
 
 
 if __name__ == "__main__":
