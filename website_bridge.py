@@ -6,7 +6,7 @@ import io
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -297,15 +297,28 @@ class WebsiteBridge:
         except requests.RequestException as error:
             print(f"[BATCH] Không đọc được owner nội bộ của web: {error}", flush=True)
             owner = None
-        returned: list[tuple[bytes, str]] = []
+        tasks = []
         for position, (source_url, price) in enumerate(zip(batch.images, prices), start=1):
             digest = hashlib.sha256(f"{batch.sender_id}:{source_url}".encode()).hexdigest()[:12]
             title = f"fat_{digest}"
-            try:
-                rendered = self._upload_and_store(base, source_url, price, title, main_acc, owner)
-                returned.append((rendered, f"{position:03d}.jpg"))
-            except (KeyError, OSError, ValueError, requests.RequestException, RuntimeError) as error:
-                print(f"[BATCH] Bỏ ảnh vị trí {position} (giá {format_vnd(price)}): {error}", flush=True)
+            tasks.append((position, source_url, price, title))
+
+        # Downloads, Cloudinary uploads, and independent account rows can run in
+        # parallel.  Results are put back by position before the Zalo album is
+        # returned, so concurrency never changes image-to-price pairing.
+        completed: dict[int, tuple[bytes, str]] = {}
+        with ThreadPoolExecutor(max_workers=min(3, len(tasks))) as workers:
+            futures = {
+                workers.submit(self._upload_and_store, base, source_url, price, title, main_acc, owner): (position, price)
+                for position, source_url, price, title in tasks
+            }
+            for future in as_completed(futures):
+                position, price = futures[future]
+                try:
+                    completed[position] = (future.result(), f"{position:03d}.jpg")
+                except (KeyError, OSError, ValueError, requests.RequestException, RuntimeError) as error:
+                    print(f"[BATCH] Bỏ ảnh vị trí {position} (giá {format_vnd(price)}): {error}", flush=True)
+        returned = [completed[position] for position, _, _, _ in tasks if position in completed]
         if not returned:
             print("[BATCH] Không ảnh nào được cập nhật, không trả album.", flush=True)
             return
