@@ -145,10 +145,8 @@ class JsonLoggerClient(ZaloAPI):
             result = self.website_bridge.find_owner_by_image(image_url)
             if result:
                 text = (
-                    "🔎 Kết quả /timchu\n"
-                    f"Chủ acc: {result['main_acc']}\n"
-                    f"Mã acc: {result['title']}\n"
-                    f"Độ khớp ảnh: {result['confidence']}%"
+                    "🔎 Chủ tài khoản\n"
+                    f"{result['main_acc']}"
                 )
             else:
                 text = (
