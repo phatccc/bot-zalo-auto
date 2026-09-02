@@ -59,7 +59,7 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
         output = Image.open(io.BytesIO(priced_image(source.getvalue(), 12_500_000)))
         self.assertEqual(output.size, (1920, 960))
 
-    def test_permanent_http_error_does_not_wait_for_retries(self):
+    def test_http_error_retries_three_times(self):
         response = requests.Response()
         response.status_code = 400
         attempts = []
@@ -71,8 +71,8 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
         with patch("website_bridge.time.sleep") as sleep:
             with self.assertRaises(RuntimeError):
                 retry(bad_request, "ảnh test")
-        self.assertEqual(len(attempts), 1)
-        sleep.assert_not_called()
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_image_signature_survives_centred_price_badge(self):
         source = Image.new("RGB", (900, 600), "black")

@@ -124,29 +124,20 @@ def main_acc_from_text(text: str, fallback: str) -> str:
     return fallback[:200]
 
 
-def should_retry(error: BaseException) -> bool:
-    """Retry temporary transport/server failures, not permanent bad requests."""
-    if isinstance(error, requests.HTTPError) and error.response is not None:
-        status = error.response.status_code
-        return status in {408, 425, 429} or status >= 500
-    return isinstance(error, (OSError, ValueError, requests.RequestException))
-
-
 def retry(action: Callable[[], Any], label: str) -> Any:
-    """Retry only transient image failures, leaving five seconds between tries."""
+    """Retry mọi thao tác ảnh 3 lần (kể cả 400/404); URL Zalo CDN có thể xuất hiện trễ."""
     error = None
     for attempt in range(1, 4):
         try:
             return action()
         except (OSError, ValueError, requests.RequestException) as caught:
             error = caught
-            if attempt < 3 and should_retry(caught):
-                print(f"[BATCH] {label} lỗi, thử lại lần {attempt + 1}/3 sau 5 giây.", flush=True)
+            if attempt < 3:
+                print(f"[BATCH] {label} lỗi ({caught.__class__.__name__}), thử lại lần {attempt + 1}/3 sau 5 giây.", flush=True)
                 time.sleep(5)
                 continue
             break
-    suffix = " sau 3 lần" if attempt == 3 else ""
-    raise RuntimeError(f"{label} thất bại{suffix}: {error}")
+    raise RuntimeError(f"{label} thất bại sau 3 lần: {error}")
 
 
 IMAGE_HASH_BITS = 16
@@ -380,16 +371,20 @@ class WebsiteBridge:
                 }
         return best
 
-    def _upload_and_store(self, base: str, source_url: str, price: int, title: str, main_acc: str, owner: str | None, batch_id: str, position: int, existing_id: str | None, lookup_per_item: bool) -> bytes:
+    def _upload_and_store(self, base: str, source_url: str, price: int, title: str, main_acc: str, owner: str | None, batch_id: str, position: int, existing_id: str | None, lookup_per_item: bool, prefetched_content: bytes | None = None) -> bytes:
         session = self._http()
 
-        def download_original():
-            self.progress.update_item(batch_id, position, "Đang tải và dán giá")
-            response = session.get(source_url, timeout=60)
-            response.raise_for_status()
-            return response.content
+        if prefetched_content is not None:
+            self.progress.update_item(batch_id, position, "Đang dán giá")
+            original = prefetched_content
+        else:
+            def download_original():
+                self.progress.update_item(batch_id, position, "Đang tải và dán giá")
+                response = session.get(source_url, timeout=60)
+                response.raise_for_status()
+                return response.content
 
-        original = retry(download_original, f"Ảnh {title}")
+            original = retry(download_original, f"Ảnh {title}")
         # Save a watermark-tolerant fingerprint of the original alongside the
         # account.  `/timchu` later compares its untouched border regions.
         image_hash = image_signature(original)
@@ -496,6 +491,30 @@ class WebsiteBridge:
             worker_count = max(1, min(6, int(requested_workers), len(tasks)))
         except (TypeError, ValueError):
             worker_count = min(6, len(tasks))
+        # Pre-download tất cả ảnh ngay lập tức — URL Zalo CDN có thể hết hạn
+        # trong lúc các worker trước đang upload Cloudinary. Tải trước đảm bảo
+        # mọi ảnh đều được lấy khi token còn hiệu lực.
+        self.progress.update_batch(batch_id, f"Đang tải trước {len(tasks)} ảnh")
+        prefetched: dict[str, bytes] = {}
+        with ThreadPoolExecutor(max_workers=min(len(tasks), 10)) as dl_pool:
+            def _fetch(url: str) -> tuple[str, bytes]:
+                session = self._http()
+                def _get():
+                    r = session.get(url, timeout=60)
+                    r.raise_for_status()
+                    return r.content
+                return url, retry(_get, f"Prefetch {url.split('/')[-1][:20]}")
+            dl_futures = {dl_pool.submit(_fetch, source_url): position for position, source_url, price, title in tasks}
+            for dl_future in as_completed(dl_futures):
+                pos = dl_futures[dl_future]
+                try:
+                    url, content = dl_future.result()
+                    prefetched[url] = content
+                    self.progress.update_item(batch_id, pos, "Đã tải")
+                except (OSError, ValueError, requests.RequestException, RuntimeError) as dl_err:
+                    self.progress.update_item(batch_id, pos, "Lỗi tải trước", str(dl_err))
+                    print(f"[BATCH] Prefetch ảnh {pos} thất bại: {dl_err}", flush=True)
+
         self.progress.update_batch(batch_id, f"Đang xử lý song song {worker_count} ảnh")
         with ThreadPoolExecutor(max_workers=worker_count) as workers:
             futures = {
@@ -511,6 +530,7 @@ class WebsiteBridge:
                     position,
                     existing_ids.get(title) if existing_ids is not None else None,
                     existing_ids is None,
+                    prefetched.get(source_url),
                 ): (position, price)
                 for position, source_url, price, title in tasks
             }
