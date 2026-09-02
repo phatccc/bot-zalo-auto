@@ -58,6 +58,14 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
     def test_normal_chat_with_numbers_is_not_a_price_list(self):
         self.assertEqual(parse_prices("tìm 2 ẹc áo a hoặc b mũ đinh 20 quay 3x tìm quạ 7 ướp đinh ạ"), [])
         self.assertEqual(parse_prices("Tìm couple đen s1"), [])
+        self.assertEqual(parse_prices("gửi ae ít acc nhờ ae treo hộ nha\nBao back 10% trong tháng nhé ae ơi"), [])
+
+    def test_spaced_prices_currency_and_common_sale_notes(self):
+        text = "2m 8 - 2tr 8 - 1 triệu 250 - 2m5đ - 3m vnd - 4m fix - 5m ib"
+        self.assertEqual(parse_prices(text), [
+            2_800_000, 2_800_000, 1_250_000, 2_500_000,
+            3_000_000, 4_000_000, 5_000_000,
+        ])
 
     def test_compact_badge_price(self):
         self.assertEqual(format_price_badge(12_500_000), "12m5")

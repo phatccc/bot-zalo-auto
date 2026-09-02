@@ -29,7 +29,10 @@ MISSING_ACCOUNT_TOKENS = {"bay"}
 # These are common sale qualifiers, not account-description words.  They are
 # accepted only after a price-only line has otherwise been identified, keeping
 # ordinary messages with numbers from starting a batch accidentally.
-SALE_QUALIFIER_TOKENS = {"gct", "rip", "gg"}
+SALE_QUALIFIER_TOKENS = {
+    "gct", "rip", "gg", "fix", "ib", "bao", "gop", "góp", "full",
+    "vnd", "vnđ", "đ", "dong", "đồng",
+}
 MISSING_ACCOUNT_PRICE = 999_000_000
 
 
@@ -71,8 +74,18 @@ def parse_prices(text: str) -> list[int]:
         # index.  Numeric markers are removed only when the following price
         # has an explicit money unit (`1. 2m8`, `2) 850k`).
         line = re.sub(r"^\d+[.)]\s+(?=\d+(?:[.,]\d+)?(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)\b)", "", line, flags=re.I)
+        # Merge a deliberately spaced million fraction (`2m 8`, `2 tr 8`,
+        # `1 triệu 250`) without merging separate values such as `2m 8m`.
+        line = re.sub(
+            r"(\d+(?:[.,]\d+)?)\s*(?:m|tr|triệu|trieu)\.?\s+(\d{1,3})(?!\s*(?:m|k|tr|triệu|trieu)\b)",
+            r"\1m\2",
+            line,
+            flags=re.I,
+        )
         line = re.sub(r"(\d+(?:[.,]\d+)?)\s+(m|k)\b", r"\1\2", line, flags=re.I)
         line = re.sub(r"(\d+(?:[.,]\d+)?)\s*(?:triệu|trieu|tr)\b", r"\1tr", line, flags=re.I)
+        # Currency written immediately after the number is cosmetic: `2m5đ`.
+        line = re.sub(r"(?<=\d)(?:vnđ|vnd|đồng|dong|đ)\b", "", line, flags=re.I)
         tokens = re.sub(r"\s*[-|;/]\s*", " ", line).split()
         normalized = [token.strip(".,;:()[]{}").lower() for token in tokens]
         price_tokens = [token for token in normalized if PRICE_TOKEN.fullmatch(token) or token in MISSING_ACCOUNT_TOKENS]
