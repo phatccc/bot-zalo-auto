@@ -26,6 +26,32 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
         self.assertEqual(parse_prices("2.8m; 2,8m; 2tr8"), [2_800_000, 2_800_000, 2_800_000])
         self.assertEqual(parse_prices("Giá: 2 triệu\n2.800.000\n2,800,000"), [2_000_000, 2_800_000, 2_800_000])
 
+    def test_price_grids_and_sale_qualifiers(self):
+        bare_grid = """Nhà còn vài bé nhờ ae treo giùm em
+18. 6.5. 3.5
+10. 57. 9.5
+2.5. 10.5. 6
+10.5. 10. 16
+14.5. 36. 14.5
+14.5. 14. 68
+5.5"""
+        self.assertEqual(parse_prices(bare_grid), [
+            18_000_000, 6_500_000, 3_500_000, 10_000_000, 57_000_000,
+            9_500_000, 2_500_000, 10_500_000, 6_000_000, 10_500_000,
+            10_000_000, 16_000_000, 14_500_000, 36_000_000, 14_500_000,
+            14_500_000, 14_000_000, 68_000_000, 5_500_000,
+        ])
+        tagged_grid = """65m gct 62m gct 47m gct
+35m gct 46m gct 45m gct
+15 gct rip 10m gct 11m gct
+5,8 gct rip 5 gct rip 17m5 gct
+21 gct gg"""
+        self.assertEqual(parse_prices(tagged_grid), [
+            65_000_000, 62_000_000, 47_000_000, 35_000_000, 46_000_000,
+            45_000_000, 15_000_000, 10_000_000, 11_000_000, 5_800_000,
+            5_000_000, 17_500_000, 21_000_000,
+        ])
+
     def test_numbered_and_annotated_lines(self):
         self.assertEqual(parse_prices("1. 2m8\n• 3m (full)\n# 850k [VNG]"), [2_800_000, 3_000_000, 850_000])
 

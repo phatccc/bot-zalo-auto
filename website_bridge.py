@@ -26,6 +26,10 @@ def price_text_without_owner(text: str) -> str:
 
 PRICE_TOKEN = re.compile(r"^(?:\d+(?:[.,]\d+)?(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)?|\d{1,3}(?:[.,]\d{3})+)$", re.I)
 MISSING_ACCOUNT_TOKENS = {"bay"}
+# These are common sale qualifiers, not account-description words.  They are
+# accepted only after a price-only line has otherwise been identified, keeping
+# ordinary messages with numbers from starting a batch accidentally.
+SALE_QUALIFIER_TOKENS = {"gct", "rip", "gg"}
 MISSING_ACCOUNT_PRICE = 999_000_000
 
 
@@ -62,14 +66,24 @@ def parse_prices(text: str) -> list[int]:
         line = re.sub(r"\([^)]*(?:\)|$)|\[[^]]*(?:\]|$)", " ", line).strip()
         # Optional `giá:` prefix and common list markers (`1. 2m8`, `• 2m8`).
         line = re.sub(r"^(?:giá|gia|price)\s*[:=-]?\s*", "", line, flags=re.I)
-        line = re.sub(r"^(?:[#•*]\s*|\d+[.)]\s+)", "", line)
+        line = re.sub(r"^[#•*]\s*", "", line)
+        # Do not mistake a real bare price such as `18. 6.5 3.5` for a list
+        # index.  Numeric markers are removed only when the following price
+        # has an explicit money unit (`1. 2m8`, `2) 850k`).
+        line = re.sub(r"^\d+[.)]\s+(?=\d+(?:[.,]\d+)?(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)\b)", "", line, flags=re.I)
         line = re.sub(r"(\d+(?:[.,]\d+)?)\s+(m|k)\b", r"\1\2", line, flags=re.I)
         line = re.sub(r"(\d+(?:[.,]\d+)?)\s*(?:triệu|trieu|tr)\b", r"\1tr", line, flags=re.I)
         tokens = re.sub(r"\s*[-|;/]\s*", " ", line).split()
         normalized = [token.strip(".,;:()[]{}").lower() for token in tokens]
-        if tokens and all(PRICE_TOKEN.fullmatch(token) or token in MISSING_ACCOUNT_TOKENS for token in normalized):
-            raw_tokens.extend(normalized)
-            has_real_price = has_real_price or any(PRICE_TOKEN.fullmatch(token) for token in normalized)
+        price_tokens = [token for token in normalized if PRICE_TOKEN.fullmatch(token) or token in MISSING_ACCOUNT_TOKENS]
+        qualifiers = [token for token in normalized if token not in price_tokens]
+        is_plain_price_line = tokens and len(price_tokens) == len(normalized)
+        # Sellers commonly append `gct`, `rip` or `gg`, for example
+        # `65m gct` / `15 gct rip`.  Those suffixes do not change the price.
+        is_qualified_price_line = price_tokens and qualifiers and all(token in SALE_QUALIFIER_TOKENS for token in qualifiers)
+        if is_plain_price_line or is_qualified_price_line:
+            raw_tokens.extend(price_tokens)
+            has_real_price = has_real_price or any(PRICE_TOKEN.fullmatch(token) for token in price_tokens)
     if not has_real_price:
         return []
     prices = []
