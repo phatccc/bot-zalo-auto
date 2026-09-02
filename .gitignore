@@ -1,0 +1,17 @@
+# Private runtime configuration: never commit credentials or Zalo identifiers.
+config.js
+website.js
+.env
+.env.*
+
+# Generated runtime files.
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+zlapi.venv/
+
+# Editor and OS files.
+.vscode/
+.idea/
+.DS_Store

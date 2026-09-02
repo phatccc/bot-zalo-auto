@@ -1,0 +1,3 @@
+interface:
+  display_name: "Zalo Batch Import"
+  short_description: "Maintain safe Zalo account batches"

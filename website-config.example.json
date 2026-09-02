@@ -1,0 +1,8 @@
+{
+  "notification_chat_id": "YOUR_ZALO_USER_ID",
+  "supabase_url": "https://YOUR_PROJECT.supabase.co",
+  "supabase_service_key": "YOUR_SUPABASE_SERVICE_ROLE_KEY",
+  "cloudinary_cloud_name": "YOUR_CLOUDINARY_CLOUD_NAME",
+  "cloudinary_upload_preset": "YOUR_UNSIGNED_UPLOAD_PRESET",
+  "account_owner": "OPTIONAL_INTERNAL_WEB_USER_ID"
+}

@@ -1,0 +1,56 @@
+import io
+import unittest
+
+from PIL import Image
+
+from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, parse_prices, priced_image, raised_price
+
+
+class PriceParserTests(unittest.TestCase):
+    def test_real_price_list_with_provider_notes(self):
+        text = """Chủ: Phạm Kính
+Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
+162 (Qt)
+87 (Qt)
+50 (Qt)
+25 (VNG)
+45 (VNG)
+33 (VNG)
+27 (VNG"""
+        self.assertEqual(parse_prices(text), [162_000_000, 87_000_000, 50_000_000, 25_000_000, 45_000_000, 33_000_000, 27_000_000])
+
+    def test_common_price_notations(self):
+        self.assertEqual(parse_prices("2m8 - 3m - 850k"), [2_800_000, 3_000_000, 850_000])
+        self.assertEqual(parse_prices("2.8m; 2,8m; 2tr8"), [2_800_000, 2_800_000, 2_800_000])
+        self.assertEqual(parse_prices("Giá: 2 triệu\n2.800.000\n2,800,000"), [2_000_000, 2_800_000, 2_800_000])
+
+    def test_numbered_and_annotated_lines(self):
+        self.assertEqual(parse_prices("1. 2m8\n• 3m (full)\n# 850k [VNG]"), [2_800_000, 3_000_000, 850_000])
+
+    def test_normal_chat_with_numbers_is_not_a_price_list(self):
+        self.assertEqual(parse_prices("tìm 2 ẹc áo a hoặc b mũ đinh 20 quay 3x tìm quạ 7 ướp đinh ạ"), [])
+        self.assertEqual(parse_prices("Tìm couple đen s1"), [])
+
+    def test_compact_badge_price(self):
+        self.assertEqual(format_price_badge(12_500_000), "12m5")
+        self.assertEqual(format_price_badge(3_100_000), "3m1")
+        self.assertEqual(format_price_badge(1_550_000), "1m55")
+
+    def test_missing_account_placeholder_keeps_image_position(self):
+        self.assertEqual(parse_prices("13m - 12 m - bay"), [13_000_000, 12_000_000, MISSING_ACCOUNT_PRICE])
+        self.assertEqual(parse_prices("13m\nbay\n12m"), [13_000_000, MISSING_ACCOUNT_PRICE, 12_000_000])
+        self.assertEqual(parse_prices("nick bay rồi"), [])
+        self.assertEqual(raised_price(MISSING_ACCOUNT_PRICE), MISSING_ACCOUNT_PRICE)
+        self.assertEqual(format_price_badge(MISSING_ACCOUNT_PRICE), "999m")
+
+    def test_return_image_has_a_centred_red_badge(self):
+        source = io.BytesIO()
+        Image.new("RGB", (600, 400), "black").save(source, format="JPEG")
+        output = Image.open(io.BytesIO(priced_image(source.getvalue(), 12_500_000)))
+        self.assertEqual(output.size, (600, 400))
+        centre = output.crop((180, 140, 420, 260))
+        self.assertTrue(any(red > 180 and green < 70 and blue < 70 for red, green, blue in centre.get_flattened_data()))
+
+
+if __name__ == "__main__":
+    unittest.main()

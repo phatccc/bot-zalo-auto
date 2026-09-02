@@ -1,194 +1,235 @@
 import json
-from zlapi import ZaloAPI, ZaloAPIException
-from zlapi.models import *
-from colorama import Fore, Style, init
+import tempfile
+import time
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+import requests
+from zlapi import ImageGroup, ZaloAPI
+from zlapi.models import Message, ThreadType
+from website_bridge import WebsiteBridge
 
-# Initialize colorama
-init(autoreset=True)
 
-class CustomClient(ZaloAPI):
-    def __init__(self, api_key, secret_key, imei, session_cookies):
-        super().__init__(api_key, secret_key, imei=imei, session_cookies=session_cookies)
-        self.excluded_user_ids = ['207754413506549669']
-        self.data_file = 'user_data.json'
-        self.message_counts = {}  # Track message counts
-        self.load_data()
+def as_mapping(value):
+    return dict(value) if isinstance(value, Mapping) else {}
 
-    def load_data(self):
-        """Load user data and message counts from a JSON file."""
+
+def event_summary(message, message_object):
+    """Return a compact, human-readable representation of a Zalo event."""
+    details = as_mapping(message_object)
+    content = as_mapping(message)
+    message_type = details.get("msgType", "unknown")
+
+    if message_type == "chat.reaction":
+        reaction = content.get("rIcon", "(không rõ)")
+        target = next(iter(content.get("rMsg", [])), {})
+        return {
+            "event": "Phản ứng",
+            "content": reaction,
+            "reply_to_message_id": target.get("gMsgID"),
+        }
+
+    if message_type == "chat.recommended":
+        return {
+            "event": "Thông báo/gợi ý",
+            "content": content.get("description") or content.get("title") or "(không có nội dung)",
+            "action": content.get("action"),
+        }
+
+    if message_type == "chat.photo":
+        return {
+            "event": "Ảnh",
+            "caption": content.get("title") or "(không có chú thích)",
+            "url": content.get("href"),
+        }
+
+    if isinstance(message, ImageGroup):
+        return {
+            "event": "Album ảnh",
+            "image_count": len(message.images),
+            "group_id": str(message.group_id),
+        }
+
+    if isinstance(message, str):
+        return {"event": "Tin nhắn", "content": message}
+
+    return {
+        "event": "Sự kiện khác",
+        "content": content or str(message),
+    }
+
+
+def format_time(timestamp):
+    try:
+        return datetime.fromtimestamp(int(timestamp) / 1000).astimezone().isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+class JsonLoggerClient(ZaloAPI):
+    """Zalo client that logs concise incoming events as formatted JSON."""
+
+    def __init__(self, imei, cookies, website, return_images=True):
+        super().__init__(imei=imei, cookies=cookies)
+        self.website_bridge = WebsiteBridge(website)
+        self.return_images = return_images
+        self.return_executor = ThreadPoolExecutor(max_workers=1)
+        self.returned_groups = set()
+        self.returning_threads = {}
+
+    def return_image_group(self, author_id, group_id, images, thread_id, thread_type, notification=None):
+        """Send price-labelled images only after their web update succeeded."""
+        group_key = (str(thread_id), str(author_id), str(group_id))
+        now = time.monotonic()
+        pending_return = self.returning_threads.get(str(thread_id))
+        if group_key in self.returned_groups or str(author_id) == str(self.user_id) or (pending_return and pending_return[0] > now):
+            return
+        self.returned_groups.add(group_key)
+        self.return_executor.submit(
+            self._download_and_return_group,
+            group_key,
+            images,
+            thread_id,
+            thread_type,
+            notification,
+        )
+
+    def _download_and_return_group(self, group_key, images, thread_id, thread_type, notification):
         try:
-            with open(self.data_file, 'r') as f:
-                data = json.load(f)
-                self.user_data = data.get('user_data', {})
-                self.message_counts = data.get('message_counts', {})
-        except FileNotFoundError:
-            self.user_data = {}
-            self.message_counts = {}
-        except json.JSONDecodeError:
-            self.user_data = {}
-            self.message_counts = {}
+            with tempfile.TemporaryDirectory(prefix="zalo-return-") as directory:
+                paths = []
+                for index, (content, filename) in enumerate(images, start=1):
+                    extension = Path(filename).suffix or ".jpg"
+                    path = Path(directory) / f"{index:03d}{extension}"
+                    path.write_bytes(content)
+                    paths.append(str(path))
+                self.sendMultiLocalImage(paths, thread_id, thread_type)
+                # Zalo sẽ gửi event cho chính album vừa trả. Bỏ qua nó để tránh
+                # tạo một vòng trả ảnh lặp vô hạn.
+                self.returning_threads[str(thread_id)] = (time.monotonic() + 30, len(images))
+                if notification:
+                    self.send(Message(text=notification), thread_id, thread_type)
+            print(f"[RETURN] Đã gửi album {len(images)} ảnh đã dán giá tới {thread_id}.", flush=True)
+        except Exception as error:
+            self.returned_groups.discard(group_key)
+            print(f"[RETURN] Không thể gửi lại album: {error}", flush=True)
 
-    def save_data(self):
-        """Save user data and message counts to a JSON file."""
-        with open(self.data_file, 'w') as f:
-            json.dump({'user_data': self.user_data, 'message_counts': self.message_counts}, f, indent=4)
-
-    def get_user_data(self, user_id):
-        """Get user data for a specific user ID, initializing if not present."""
-        if user_id not in self.user_data:
-            self.user_data[user_id] = {'balance': 0, 'wins': 0, 'losses': 0}
-        return self.user_data[user_id]
-
-    def update_message_count(self, thread_id, author_id):
-        """Update message count for a specific thread and author."""
-        if thread_id not in self.message_counts:
-            self.message_counts[thread_id] = {}
-        if author_id not in self.message_counts[thread_id]:
-            self.message_counts[thread_id][author_id] = 0
-        self.message_counts[thread_id][author_id] += 1
-
-    def fetchUserInfo(self, userId):
-        """Fetch user info and return zaloName or displayName."""
+    def resolve_sender_name(self, author_id, details):
+        """Zalo image events often omit dName; resolve it before creating a batch."""
+        name = details.get("dName") or details.get("displayName") or details.get("zaloName")
+        if name:
+            return str(name)
         try:
-            user_info = super().fetchUserInfo(userId)
-            print(f"Fetched user info for {userId}: {user_info}")  # Debug print
-
-            if 'changed_profiles' in user_info and userId in user_info['changed_profiles']:
-                zalo_name = user_info['changed_profiles'][userId].get('zaloName', None)
-                if zalo_name:
-                    return zalo_name
-                else:
-                    display_name = user_info['changed_profiles'][userId].get('displayName', userId)
-                    return display_name
-            else:
-                return userId
-
-        except Exception as e:
-            print(f"{Fore.RED}Error fetching user info: {e}")
-            return userId  # Return userId if there is an error
-
-    def is_admin(self, thread_id, user_id):
-        """Check if a user is an admin in a specific thread."""
-        try:
-            group_info = self.fetchGroupInfo(groupId=thread_id)
-            print(group_info)
-            admin_ids = group_info.gridInfoMap[thread_id]['adminIds']
-            creator_id = group_info.gridInfoMap[thread_id]['creatorId']
-            print(admin_ids)
-            return user_id in admin_ids or user_id == creator_id
-        except ZaloAPIException as e:
-            print(f"{Fore.RED}Error checking admin status: {e}")
-            return False
-
-    def handle_count(self, message_object, thread_id, author_id):
-        """Handle the /count command to list message counts per user in a thread."""
-        if hasattr(message_object, 'content') and isinstance(message_object.content, str):
-            if message_object.content.startswith('/count'):
-                try:
-                    if thread_id not in self.message_counts:
-                        self.message_counts[thread_id] = {}
-
-                    counts = self.message_counts[thread_id]
-                    if not counts:
-                        response = "Chưa có tin nhắn nào trong nhóm này."
-                    else:
-                        sorted_counts = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:10]
-                        response = "Top 10 người gửi tin nhắn nhiều nhất:\n"
-                        for user_id, count in sorted_counts:
-                            display_name = self.fetchUserInfo(userId=user_id)
-                            response += f"{display_name} ({user_id}): {count} tin nhắn\n"
-
-                    self.send(
-                        Message(text=response),
-                        thread_id=thread_id,
-                        thread_type=ThreadType.GROUP
-                    )
-
-                    self.save_data()
-
-                except Exception as e:
-                    self.send(
-                        Message(text="Đã xảy ra lỗi trong khi xử lý lệnh của bạn."),
-                        thread_id=thread_id,
-                        thread_type=ThreadType.GROUP
-                    )
-                    print(f"{Fore.RED}Error handling /count command: {e}")
-
-    def handle_kick(self, message_object, thread_id, author_id):
-        """Handle the /kick command to remove a user from the group."""
-        if hasattr(message_object, 'content') and isinstance(message_object.content, str):
-            if message_object.content.startswith('/kick '):
-                try:
-                    if self.is_admin(thread_id, author_id):
-                        if 'mentions' in message_object and message_object.mentions:
-                            mentioned_user_id = message_object.mentions[0]['uid']
-                            if mentioned_user_id not in self.excluded_user_ids:
-                                try:
-                                    self.kickUsersFromGroup([mentioned_user_id], thread_id)
-                                    self.send(
-                                        Message(text="Người dùng đã bị đuổi khỏi nhóm."),
-                                        thread_id=thread_id,
-                                        thread_type=ThreadType.GROUP,
-                                        mark_message="urgent"
-                                    )
-                                except ZaloAPIException as e:
-                                    self.send(
-                                        Message(text="Không thể đuổi người dùng."),
-                                        thread_id=thread_id,
-                                        thread_type=ThreadType.GROUP
-                                    )
-                            else:
-                                self.send(
-                                    Message(text="Không thể đuổi người dùng đã chỉ định."),
-                                    thread_id=thread_id,
-                                    thread_type=ThreadType.GROUP
-                                )
-                        else:
-                            self.send(
-                                Message(text="Không có người dùng nào được đề cập."),
-                                thread_id=thread_id,
-                                thread_type=ThreadType.GROUP
-                            )
-                    else:
-                        self.send(
-                            Message(text="Bạn không có quyền sử dụng lệnh này."),
-                            thread_id=thread_id,
-                            thread_type=ThreadType.GROUP
-                        )
-                except Exception as e:
-                    self.send(
-                        Message(text="Đã xảy ra lỗi khi xử lý lệnh /kick."),
-                        thread_id=thread_id,
-                        thread_type=ThreadType.GROUP
-                    )
-                    print(f"{Fore.RED}Error handling /kick command: {e}")
+            profile_data = as_mapping(self.fetchUserInfo(author_id))
+            profiles = as_mapping(profile_data.get("changed_profiles") or profile_data.get("profiles"))
+            profile = as_mapping(profiles.get(str(author_id)))
+            return str(profile.get("zaloName") or profile.get("displayName") or profile.get("name") or "(không rõ)")
+        except Exception:
+            return "(không rõ)"
 
     def onMessage(self, mid, author_id, message, message_object, thread_id, thread_type):
-        """Process incoming messages and handle commands."""
-        print(f"{Fore.GREEN}Received message:\n"
-              "------------------------------\n"
-              f"**Message Details:**\n"
-              f"- **Message:** {Style.BRIGHT}{message} {Style.NORMAL}\n"
-              f"- **Author ID:** {Fore.CYAN}{author_id} {Style.NORMAL}\n"
-              f"- **Thread ID:** {Fore.YELLOW}{thread_id}\n"
-              f"- **Thread Type:** {Fore.BLUE}{thread_type}\n"
-              f"- **Message Object:** {Style.DIM}{message_object}\n"
-              f"{Fore.GREEN}------------------------------\n"
-              )
+        pending_return = self.returning_threads.get(str(thread_id))
+        if isinstance(message, ImageGroup) and pending_return and pending_return[0] > time.monotonic() and len(message.images) == pending_return[1]:
+            # Websocket echo of the album this bot just returned, not a new batch.
+            self.returning_threads.pop(str(thread_id), None)
+            print("[RETURN] Bỏ qua event album do bot vừa gửi.", flush=True)
+            return
+        details = as_mapping(message_object)
+        sender_name = self.resolve_sender_name(author_id, details)
+        details["dName"] = sender_name
+        event = {
+            "time": format_time(details.get("ts")),
+            "message_id": mid,
+            "message_type": details.get("msgType", "unknown"),
+            "sender": {
+                "name": sender_name,
+                "id": author_id,
+            },
+            "conversation": {
+                "type": str(thread_type).removeprefix("ThreadType."),
+                "id": thread_id,
+            },
+            **event_summary(message, message_object),
+        }
+        print(json.dumps(event, ensure_ascii=False, indent=2, default=str), flush=True)
+        print()
+        return_callback = None
+        if self.return_images and isinstance(message, ImageGroup):
+            def return_callback(images, result):
+                # Lists can come from anyone in a group, but confirmations and the
+                # labelled album always go to the bot owner in a private chat.
+                destination = str(self.website_bridge.settings.get("notification_chat_id") or "").strip()
+                if not destination:
+                    print("[RETURN] Thiếu notification_chat_id trong website.js; không gửi album riêng.", flush=True)
+                    return
+                notification = (
+                    "✅ Đã cập nhật list lên web thành công.\n"
+                    f"Chủ acc: {result['main_acc']}\n"
+                    f"Người gửi list: {result['sender_name']} ({result['sender_id']})\n"
+                    f"Số acc: {result['count']}"
+                )
+                self.return_image_group(
+                    author_id,
+                    message.group_id,
+                    images,
+                    destination,
+                    ThreadType.USER,
+                    notification,
+                )
+        self.website_bridge.receive(mid, author_id, message, details, thread_id, thread_type, return_callback)
 
-        try:
-            self.update_message_count(thread_id, author_id)
 
-            self.handle_kick(message_object, thread_id, author_id)
+def load_config():
+    """Load IMEI and cookies from config.js, which uses JSON format."""
+    config_path = Path(__file__).with_name("config.js")
+    try:
+        with config_path.open("r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Không tìm thấy file cấu hình: {config_path}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"config.js không phải JSON hợp lệ: {error}") from error
 
-            self.handle_count(message_object, thread_id, author_id)
-                
-        except Exception as ex:
-            print(f"{Fore.RED}Error processing message: {ex}")
+    required_keys = ("imei", "cookie_name")
+    missing_keys = [key for key in required_keys if key not in config]
+    if missing_keys:
+        raise RuntimeError(f"config.js thiếu trường: {', '.join(missing_keys)}")
+    if not isinstance(config["cookie_name"], dict):
+        raise RuntimeError("cookie_name trong config.js phải là một object JSON.")
 
-imei = ""
-session_cookies = {
+    return config
 
-}
-client = CustomClient('api_key', 'secret_key', imei=imei, session_cookies=session_cookies)
-client.listen()
+
+def load_website_config():
+    """Load the bot's direct Cloudinary/Supabase settings."""
+    config_path = Path(__file__).with_name("website.js")
+    try:
+        with config_path.open("r", encoding="utf-8") as config_file:
+            settings = json.load(config_file)
+    except FileNotFoundError as error:
+        raise RuntimeError(f"Không tìm thấy cấu hình website: {config_path}") from error
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"website.js không phải JSON hợp lệ: {error}") from error
+
+    required = ("supabase_url", "supabase_service_key", "cloudinary_cloud_name", "cloudinary_upload_preset")
+    missing = [name for name in required if not isinstance(settings.get(name), str) or not settings[name].strip()]
+    if missing:
+        raise RuntimeError("website.js thiếu cấu hình: " + ", ".join(missing))
+    return settings
+
+
+def main():
+    config = load_config()
+    website = load_website_config()
+    client = JsonLoggerClient(
+        imei=config["imei"],
+        cookies=config["cookie_name"],
+        website=website,
+        return_images=config.get("return_images", True),
+    )
+    client.listen()
+
+
+if __name__ == "__main__":
+    main()
