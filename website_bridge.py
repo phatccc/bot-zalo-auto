@@ -143,9 +143,18 @@ def priced_image(content: bytes, price: int) -> bytes:
     width, height = image.size
     label = format_price_badge(price)
     size = max(32, min(width, height) // 7)
-    try:
-        font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", size)
-    except OSError:
+    font = None
+    for font_path in (
+        "C:/Windows/Fonts/arialbd.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ):
+        try:
+            font = ImageFont.truetype(font_path, size)
+            break
+        except OSError:
+            continue
+    if font is None:
         font = ImageFont.load_default()
     draw = ImageDraw.Draw(image, "RGBA")
     box = draw.textbbox((0, 0), label, font=font)
