@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+from urllib.request import urlopen
 
 
 class ProgressTracker:
@@ -128,4 +130,18 @@ def start_dashboard(tracker: ProgressTracker, settings: dict[str, Any]) -> str |
         print(f"[DASHBOARD] Không khởi động được cổng {host}:{port}: {error}", flush=True)
         return None
     threading.Thread(target=server.serve_forever, daemon=True, name="progress-dashboard").start()
-    return f"http://<IP-VPS-CUA-BAN>:{port}" if host in {"0.0.0.0", "::"} else f"http://{host}:{port}"
+    configured_url = str(config.get("public_url") or "").strip().rstrip("/")
+    if configured_url and "YOUR_" not in configured_url:
+        return configured_url
+    if host not in {"0.0.0.0", "::"}:
+        return f"http://{host}:{port}"
+    # Show a usable address in the startup log without baking a user's VPS IP
+    # into source control.  This lookup is best-effort and never blocks the bot.
+    try:
+        with urlopen("https://api.ipify.org", timeout=2) as response:
+            public_ip = response.read().decode("ascii").strip()
+        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", public_ip):
+            return f"http://{public_ip}:{port}"
+    except OSError:
+        pass
+    return f"http://<IP-VPS-CUA-BAN>:{port}"
