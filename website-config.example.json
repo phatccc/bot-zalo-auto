@@ -5,7 +5,8 @@
   "cloudinary_cloud_name": "YOUR_CLOUDINARY_CLOUD_NAME",
   "cloudinary_upload_preset": "YOUR_UNSIGNED_UPLOAD_PRESET",
   "account_owner": "OPTIONAL_INTERNAL_WEB_USER_ID",
-  "batch_workers": 4,
+  "batch_workers": 6,
+  "return_image_max_dimension": 1920,
   "dashboard": {
     "enabled": true,
     "host": "0.0.0.0",

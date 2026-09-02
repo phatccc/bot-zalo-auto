@@ -1,9 +1,11 @@
 import io
 import unittest
+from unittest.mock import patch
 
 from PIL import Image
+import requests
 
-from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, parse_prices, priced_image, raised_price
+from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, parse_prices, priced_image, raised_price, retry
 
 
 class PriceParserTests(unittest.TestCase):
@@ -50,6 +52,27 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
         self.assertEqual(output.size, (600, 400))
         centre = output.crop((180, 140, 420, 260))
         self.assertTrue(any(red > 180 and green < 70 and blue < 70 for red, green, blue in centre.get_flattened_data()))
+
+    def test_return_image_is_bounded_without_changing_small_images(self):
+        source = io.BytesIO()
+        Image.new("RGB", (2400, 1200), "black").save(source, format="JPEG")
+        output = Image.open(io.BytesIO(priced_image(source.getvalue(), 12_500_000)))
+        self.assertEqual(output.size, (1920, 960))
+
+    def test_permanent_http_error_does_not_wait_for_retries(self):
+        response = requests.Response()
+        response.status_code = 400
+        attempts = []
+
+        def bad_request():
+            attempts.append(1)
+            raise requests.HTTPError("bad request", response=response)
+
+        with patch("website_bridge.time.sleep") as sleep:
+            with self.assertRaises(RuntimeError):
+                retry(bad_request, "ảnh test")
+        self.assertEqual(len(attempts), 1)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

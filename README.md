@@ -35,10 +35,12 @@ Tạo `website.js` từ `website-config.example.json`, sau đó điền các gi�
 
 ## Tốc độ và trang theo dõi
 
-Bot xử lý tối đa 4 ảnh song song mặc định, vẫn ghép ảnh với giá và trả album
-theo đúng thứ tự. Có thể chỉnh `"batch_workers"` từ `1` đến `5` trong
-`website.js`; VPS 2 vCore nên giữ `4` để nhanh nhưng tránh làm Cloudinary/Zalo
-quá tải.
+Bot xử lý tối đa 6 ảnh song song mặc định, vẫn ghép ảnh với giá và trả album
+theo đúng thứ tự. Ảnh gốc vẫn được gửi nguyên vẹn lên web; chỉ ảnh trả về Zalo
+được giới hạn cạnh dài 1920px để dán giá, nén và gửi nhanh hơn. Có thể chỉnh
+`"batch_workers"` từ `1` đến `6` và `"return_image_max_dimension"` trong
+`website.js`. Đặt `return_image_max_dimension` bằng `0` nếu thực sự cần ảnh
+trả về Zalo ở độ phân giải gốc.
 
 Khi chạy, bot mở dashboard tại cổng `8787`. Từ máy khác, vào:
 

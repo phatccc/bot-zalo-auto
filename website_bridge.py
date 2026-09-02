@@ -123,24 +123,40 @@ def main_acc_from_text(text: str, fallback: str) -> str:
     return fallback[:200]
 
 
+def should_retry(error: BaseException) -> bool:
+    """Retry temporary transport/server failures, not permanent bad requests."""
+    if isinstance(error, requests.HTTPError) and error.response is not None:
+        status = error.response.status_code
+        return status in {408, 425, 429} or status >= 500
+    return isinstance(error, (OSError, ValueError, requests.RequestException))
+
+
 def retry(action: Callable[[], Any], label: str) -> Any:
-    """Try an image action three times, leaving five seconds between retries."""
+    """Retry only transient image failures, leaving five seconds between tries."""
     error = None
     for attempt in range(1, 4):
         try:
             return action()
         except (OSError, ValueError, requests.RequestException) as caught:
             error = caught
-            if attempt < 3:
+            if attempt < 3 and should_retry(caught):
                 print(f"[BATCH] {label} lỗi, thử lại lần {attempt + 1}/3 sau 5 giây.", flush=True)
                 time.sleep(5)
-    raise RuntimeError(f"{label} thất bại sau 3 lần: {error}")
+                continue
+            break
+    suffix = " sau 3 lần" if attempt == 3 else ""
+    raise RuntimeError(f"{label} thất bại{suffix}: {error}")
 
 
-def priced_image(content: bytes, price: int) -> bytes:
+def priced_image(content: bytes, price: int, max_dimension: int = 1920) -> bytes:
     """Create the red, centred sale-price badge used only for Zalo returns."""
     with Image.open(io.BytesIO(content)) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
+    # This copy is sent only through Zalo.  Keeping its longest edge bounded
+    # avoids spending most of the batch time encoding a 4K/8K duplicate, while
+    # the untouched full-resolution original is still what Cloudinary receives.
+    if max_dimension > 0 and max(image.size) > max_dimension:
+        image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     width, height = image.size
     label = format_price_badge(price)
     # Keep the price readable without obscuring the account details.  The badge
@@ -174,7 +190,7 @@ def priced_image(content: bytes, price: int) -> bytes:
     output = io.BytesIO()
     # This is only the temporary Zalo return image.  Faster JPEG encoding keeps
     # the label clear while the original full-quality bytes remain on the web.
-    image.save(output, format="JPEG", quality=88, optimize=False)
+    image.save(output, format="JPEG", quality=82, optimize=False)
     return output.getvalue()
 
 
@@ -193,7 +209,20 @@ class WebsiteBridge:
         self.batches: dict[tuple[str, str], PendingBatch] = {}
         self.lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=1)
+        # Rendering is CPU-heavy, whereas downloads/uploads are I/O-heavy.  A
+        # small separate pool lets Cloudinary work while a labelled return copy
+        # is encoded, without oversubscribing a small VPS.
+        self.render_executor = ThreadPoolExecutor(max_workers=2)
         self.progress = progress or ProgressTracker()
+        self._http_local = threading.local()
+
+    def _http(self) -> requests.Session:
+        """One persistent connection pool per worker thread."""
+        session = getattr(self._http_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._http_local.session = session
+        return session
 
     def receive(self, mid, author_id, message, details, thread_id, thread_type, return_callback=None) -> None:
         urls = image_urls(message)
@@ -225,7 +254,7 @@ class WebsiteBridge:
         configured = str(self.settings.get("account_owner") or "").strip()
         if configured:
             return configured
-        response = requests.get(
+        response = self._http().get(
             f"{base}/accounts",
             params={"select": "owner", "owner": "not.is.null", "order": "id.desc", "limit": "1"},
             headers=self._headers(),
@@ -237,20 +266,48 @@ class WebsiteBridge:
             return str(rows[0]["owner"])
         return None
 
-    def _upload_and_store(self, base: str, source_url: str, price: int, title: str, main_acc: str, owner: str | None, batch_id: str, position: int) -> bytes:
-        def download_and_render():
-            self.progress.update_item(batch_id, position, "Đang tải và dán giá")
-            response = requests.get(source_url, timeout=60)
-            response.raise_for_status()
-            # Keep the original bytes for the website.  The rendered copy is only
-            # used for the album sent back through Zalo.
-            return response.content, priced_image(response.content, price)
+    def find_existing_accounts(self, base: str, titles: list[str]) -> dict[str, str]:
+        """Look up all stable image titles in one Supabase request per batch."""
+        if not titles:
+            return {}
+        response = self._http().get(
+            f"{base}/accounts",
+            params={"select": "id,title", "title": f"in.({','.join(titles)})"},
+            headers=self._headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        return {
+            str(row["title"]): str(row["id"])
+            for row in response.json()
+            if row.get("title") and row.get("id")
+        }
 
-        original, rendered = retry(download_and_render, f"Ảnh {title}")
+    def _upload_and_store(self, base: str, source_url: str, price: int, title: str, main_acc: str, owner: str | None, batch_id: str, position: int, existing_id: str | None, lookup_per_item: bool) -> bytes:
+        session = self._http()
+
+        def download_original():
+            self.progress.update_item(batch_id, position, "Đang tải và dán giá")
+            response = session.get(source_url, timeout=60)
+            response.raise_for_status()
+            return response.content
+
+        original = retry(download_original, f"Ảnh {title}")
+        try:
+            return_size = int(self.settings.get("return_image_max_dimension", 1920))
+        except (TypeError, ValueError):
+            return_size = 1920
+        # Start producing the Zalo-only image now, while this worker uploads the
+        # untouched original to Cloudinary and writes the account row.
+        rendered_future = self.render_executor.submit(
+            retry,
+            lambda: priced_image(original, price, max(0, return_size)),
+            f"Dán giá ảnh {title}",
+        )
 
         def upload_image():
             self.progress.update_item(batch_id, position, "Đang upload ảnh gốc")
-            response = requests.post(
+            response = session.post(
                 f"https://api.cloudinary.com/v1_1/{self.settings['cloudinary_cloud_name']}/image/upload",
                 # Match the previously working unsigned-upload request shape.
                 files={"file": (f"{title}.jpg", original)},
@@ -276,19 +333,24 @@ class WebsiteBridge:
         row = {"price": str(price), "description": DESCRIPTION, "image_url": image_url, "main_acc": main_acc}
         if owner:
             row["owner"] = owner
-        existing = requests.get(f"{base}/accounts", params={"select": "id", "title": f"eq.{title}"}, headers=self._headers(), timeout=30)
-        existing.raise_for_status()
-        rows = existing.json()
-        if rows:
-            account_id = rows[0]["id"]
-            updated = requests.patch(f"{base}/accounts", params={"id": f"eq.{account_id}"}, json=row, headers=self._headers(), timeout=30)
+        if lookup_per_item:
+            # A one-shot batch lookup failed; fall back to the exact former
+            # per-item behavior rather than risking an accidental duplicate.
+            existing = session.get(f"{base}/accounts", params={"select": "id", "title": f"eq.{title}"}, headers=self._headers(), timeout=30)
+            existing.raise_for_status()
+            rows = existing.json()
+            existing_id = str(rows[0]["id"]) if rows else None
+        if existing_id:
+            account_id = existing_id
+            updated = session.patch(f"{base}/accounts", params={"id": f"eq.{account_id}"}, json=row, headers=self._headers(), timeout=30)
             updated.raise_for_status()
         else:
-            created = requests.post(f"{base}/accounts", json={"title": title, **row}, headers=self._headers(), timeout=30)
+            created = session.post(f"{base}/accounts", json={"title": title, **row}, headers=self._headers(), timeout=30)
             created.raise_for_status()
             account_id = created.json()[0]["id"]
-            linked = requests.post(f"{base}/account_images", json={"acc_id": account_id, "image_url": image_url}, headers=self._headers(), timeout=30)
+            linked = session.post(f"{base}/account_images", json={"acc_id": account_id, "image_url": image_url}, headers=self._headers(), timeout=30)
             linked.raise_for_status()
+        rendered = rendered_future.result()
         self.progress.update_item(batch_id, position, "Hoàn tất")
         return rendered
 
@@ -304,7 +366,7 @@ class WebsiteBridge:
         self.progress.update_batch(batch_id, "Đang tìm owner web")
         try:
             owner = self.resolve_account_owner(base)
-        except requests.RequestException as error:
+        except (ValueError, requests.RequestException) as error:
             print(f"[BATCH] Không đọc được owner nội bộ của web: {error}", flush=True)
             owner = None
         tasks = []
@@ -313,19 +375,40 @@ class WebsiteBridge:
             title = f"fat_{digest}"
             tasks.append((position, source_url, price, title))
 
+        self.progress.update_batch(batch_id, "Đang kiểm tra account đã có")
+        try:
+            existing_ids: dict[str, str] | None = self.find_existing_accounts(base, [title for _, _, _, title in tasks])
+        except (ValueError, requests.RequestException) as error:
+            # Retain the old per-item query path if the accelerated lookup is
+            # temporarily unavailable, so no storage logic is lost.
+            print(f"[BATCH] Không kiểm tra nhanh được account cũ, dùng chế độ dự phòng: {error}", flush=True)
+            existing_ids = None
+
         # Downloads, Cloudinary uploads, and independent account rows can run in
         # parallel.  Results are put back by position before the Zalo album is
         # returned, so concurrency never changes image-to-price pairing.
         completed: dict[int, tuple[bytes, str]] = {}
-        requested_workers = self.settings.get("batch_workers", 4)
+        requested_workers = self.settings.get("batch_workers", 6)
         try:
-            worker_count = max(1, min(5, int(requested_workers), len(tasks)))
+            worker_count = max(1, min(6, int(requested_workers), len(tasks)))
         except (TypeError, ValueError):
-            worker_count = min(4, len(tasks))
+            worker_count = min(6, len(tasks))
         self.progress.update_batch(batch_id, f"Đang xử lý song song {worker_count} ảnh")
         with ThreadPoolExecutor(max_workers=worker_count) as workers:
             futures = {
-                workers.submit(self._upload_and_store, base, source_url, price, title, main_acc, owner, batch_id, position): (position, price)
+                workers.submit(
+                    self._upload_and_store,
+                    base,
+                    source_url,
+                    price,
+                    title,
+                    main_acc,
+                    owner,
+                    batch_id,
+                    position,
+                    existing_ids.get(title) if existing_ids is not None else None,
+                    existing_ids is None,
+                ): (position, price)
                 for position, source_url, price, title in tasks
             }
             for finished_count, future in enumerate(as_completed(futures), start=1):
