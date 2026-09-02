@@ -33,6 +33,26 @@ Tạo `config.js`:
 
 Tạo `website.js` từ `website-config.example.json`, sau đó điền các giá trị thật. `notification_chat_id` là Zalo ID duy nhất nhận album ảnh đã dán giá và thông báo thành công.
 
+## Tốc độ và trang theo dõi
+
+Bot xử lý tối đa 4 ảnh song song mặc định, vẫn ghép ảnh với giá và trả album
+theo đúng thứ tự. Có thể chỉnh `"batch_workers"` từ `1` đến `5` trong
+`website.js`; VPS 2 vCore nên giữ `4` để nhanh nhưng tránh làm Cloudinary/Zalo
+quá tải.
+
+Khi chạy, bot mở dashboard tại cổng `8787`. Từ máy khác, vào:
+
+```text
+http://IP_PUBLIC_CUA_VPS:8787
+```
+
+Dashboard chỉ hiện tiến độ, chủ acc, số lượng ảnh và lỗi; không chứa IMEI,
+cookie, service key hoặc URL ảnh. Nếu VPS dùng UFW, mở cổng một lần:
+
+```bash
+sudo ufw allow 8787/tcp
+```
+
 ## Quy tắc batch
 
 - Cần số ảnh và số giá bằng nhau, tối thiểu 2.

@@ -9,6 +9,7 @@ import requests
 from zlapi import ImageGroup, ZaloAPI
 from zlapi.models import Message, ThreadType
 from website_bridge import WebsiteBridge
+from progress_dashboard import ProgressTracker, start_dashboard
 
 
 def as_mapping(value):
@@ -70,9 +71,9 @@ def format_time(timestamp):
 class JsonLoggerClient(ZaloAPI):
     """Zalo client that logs concise incoming events as formatted JSON."""
 
-    def __init__(self, imei, cookies, website, return_images=True):
+    def __init__(self, imei, cookies, website, progress, return_images=True):
         super().__init__(imei=imei, cookies=cookies)
-        self.website_bridge = WebsiteBridge(website)
+        self.website_bridge = WebsiteBridge(website, progress)
         self.return_images = return_images
         self.return_executor = ThreadPoolExecutor(max_workers=1)
         self.returned_groups = set()
@@ -222,10 +223,15 @@ def load_website_config():
 def main():
     config = load_config()
     website = load_website_config()
+    progress = ProgressTracker()
+    dashboard_url = start_dashboard(progress, website)
+    if dashboard_url:
+        print(f"[DASHBOARD] Đang chạy tại {dashboard_url}", flush=True)
     client = JsonLoggerClient(
         imei=config["imei"],
         cookies=config["cookie_name"],
         website=website,
+        progress=progress,
         return_images=config.get("return_images", True),
     )
     client.listen()

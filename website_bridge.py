@@ -13,6 +13,7 @@ from typing import Any, Callable
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from zlapi import ImageGroup
+from progress_dashboard import ProgressTracker
 
 DESCRIPTION = "Hỗ trợ ae góp chỉ từ 30% giá acc ( Ấn chức năng 'Tính góp' để tính góp )."
 OWNER_LINE = re.compile(r"^\s*(?:chủ|chu|owner|main|tk|tên|ten)(?:\s*(?:tk|acc|nick|sở\s*hữu|so\s*huu))?\s*[:=-]\s*(.+?)\s*$", re.I)
@@ -171,7 +172,9 @@ def priced_image(content: bytes, price: int) -> bytes:
     text_y = top + padding_y - box[1]
     draw.text((text_x, text_y), label, font=font, fill=(255, 255, 255, 255))
     output = io.BytesIO()
-    image.save(output, format="JPEG", quality=94, optimize=True)
+    # This is only the temporary Zalo return image.  Faster JPEG encoding keeps
+    # the label clear while the original full-quality bytes remain on the web.
+    image.save(output, format="JPEG", quality=88, optimize=False)
     return output.getvalue()
 
 
@@ -185,11 +188,12 @@ class PendingBatch:
 
 
 class WebsiteBridge:
-    def __init__(self, settings: dict[str, Any] | None):
+    def __init__(self, settings: dict[str, Any] | None, progress: ProgressTracker | None = None):
         self.settings = settings or {}
         self.batches: dict[tuple[str, str], PendingBatch] = {}
         self.lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self.progress = progress or ProgressTracker()
 
     def receive(self, mid, author_id, message, details, thread_id, thread_type, return_callback=None) -> None:
         urls = image_urls(message)
@@ -233,8 +237,9 @@ class WebsiteBridge:
             return str(rows[0]["owner"])
         return None
 
-    def _upload_and_store(self, base: str, source_url: str, price: int, title: str, main_acc: str, owner: str | None) -> bytes:
+    def _upload_and_store(self, base: str, source_url: str, price: int, title: str, main_acc: str, owner: str | None, batch_id: str, position: int) -> bytes:
         def download_and_render():
+            self.progress.update_item(batch_id, position, "Đang tải và dán giá")
             response = requests.get(source_url, timeout=60)
             response.raise_for_status()
             # Keep the original bytes for the website.  The rendered copy is only
@@ -244,6 +249,7 @@ class WebsiteBridge:
         original, rendered = retry(download_and_render, f"Ảnh {title}")
 
         def upload_image():
+            self.progress.update_item(batch_id, position, "Đang upload ảnh gốc")
             response = requests.post(
                 f"https://api.cloudinary.com/v1_1/{self.settings['cloudinary_cloud_name']}/image/upload",
                 # Match the previously working unsigned-upload request shape.
@@ -266,6 +272,7 @@ class WebsiteBridge:
 
         upload = retry(upload_image, f"Upload ảnh {title}")
         image_url = upload.json()["secure_url"]
+        self.progress.update_item(batch_id, position, "Đang lưu dữ liệu web")
         row = {"price": str(price), "description": DESCRIPTION, "image_url": image_url, "main_acc": main_acc}
         if owner:
             row["owner"] = owner
@@ -282,6 +289,7 @@ class WebsiteBridge:
             account_id = created.json()[0]["id"]
             linked = requests.post(f"{base}/account_images", json={"acc_id": account_id, "image_url": image_url}, headers=self._headers(), timeout=30)
             linked.raise_for_status()
+        self.progress.update_item(batch_id, position, "Hoàn tất")
         return rendered
 
     def _import(self, batch: PendingBatch) -> None:
@@ -292,6 +300,8 @@ class WebsiteBridge:
         prices = [raised_price(value) for value in parse_prices(batch.price_text or "")]
         base = str(self.settings["supabase_url"]).rstrip("/") + "/rest/v1"
         main_acc = main_acc_from_text(batch.price_text or "", batch.sender_name)
+        batch_id = self.progress.start(len(prices), batch.sender_name, main_acc)
+        self.progress.update_batch(batch_id, "Đang tìm owner web")
         try:
             owner = self.resolve_account_owner(base)
         except requests.RequestException as error:
@@ -307,23 +317,38 @@ class WebsiteBridge:
         # parallel.  Results are put back by position before the Zalo album is
         # returned, so concurrency never changes image-to-price pairing.
         completed: dict[int, tuple[bytes, str]] = {}
-        with ThreadPoolExecutor(max_workers=min(3, len(tasks))) as workers:
+        requested_workers = self.settings.get("batch_workers", 4)
+        try:
+            worker_count = max(1, min(5, int(requested_workers), len(tasks)))
+        except (TypeError, ValueError):
+            worker_count = min(4, len(tasks))
+        self.progress.update_batch(batch_id, f"Đang xử lý song song {worker_count} ảnh")
+        with ThreadPoolExecutor(max_workers=worker_count) as workers:
             futures = {
-                workers.submit(self._upload_and_store, base, source_url, price, title, main_acc, owner): (position, price)
+                workers.submit(self._upload_and_store, base, source_url, price, title, main_acc, owner, batch_id, position): (position, price)
                 for position, source_url, price, title in tasks
             }
-            for future in as_completed(futures):
+            for finished_count, future in enumerate(as_completed(futures), start=1):
                 position, price = futures[future]
                 try:
                     completed[position] = (future.result(), f"{position:03d}.jpg")
                 except (KeyError, OSError, ValueError, requests.RequestException, RuntimeError) as error:
                     print(f"[BATCH] Bỏ ảnh vị trí {position} (giá {format_vnd(price)}): {error}", flush=True)
+                    self.progress.update_item(batch_id, position, "Lỗi", str(error))
+                self.progress.update_batch(
+                    batch_id,
+                    "Đang xử lý ảnh",
+                    success=len(completed),
+                    failed=finished_count - len(completed),
+                )
         returned = [completed[position] for position, _, _, _ in tasks if position in completed]
         if not returned:
+            self.progress.update_batch(batch_id, "Thất bại: không có ảnh cập nhật", success=0, failed=len(tasks), done=True)
             print("[BATCH] Không ảnh nào được cập nhật, không trả album.", flush=True)
             return
         owner_status = "đã gán" if owner else "chưa tìm thấy"
         print(f"[BATCH] Đã cập nhật {len(returned)}/{len(prices)} account | Chủ acc: {main_acc} | Owner web: {owner_status}", flush=True)
+        self.progress.update_batch(batch_id, "Đã cập nhật web, đang trả album Zalo", success=len(returned), failed=len(tasks) - len(returned))
         if batch.return_callback:
             batch.return_callback(returned, {
                 "count": len(returned),
@@ -331,3 +356,4 @@ class WebsiteBridge:
                 "sender_id": batch.sender_id,
                 "sender_name": batch.sender_name,
             })
+        self.progress.update_batch(batch_id, "Hoàn tất", success=len(returned), failed=len(tasks) - len(returned), done=True)

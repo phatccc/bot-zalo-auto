@@ -4,5 +4,11 @@
   "supabase_service_key": "YOUR_SUPABASE_SERVICE_ROLE_KEY",
   "cloudinary_cloud_name": "YOUR_CLOUDINARY_CLOUD_NAME",
   "cloudinary_upload_preset": "YOUR_UNSIGNED_UPLOAD_PRESET",
-  "account_owner": "OPTIONAL_INTERNAL_WEB_USER_ID"
+  "account_owner": "OPTIONAL_INTERNAL_WEB_USER_ID",
+  "batch_workers": 4,
+  "dashboard": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8787
+  }
 }
