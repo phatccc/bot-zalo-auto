@@ -73,6 +73,7 @@ class JsonLoggerClient(ZaloAPI):
 
     def __init__(self, imei, cookies, website, progress, return_images=True):
         super().__init__(imei=imei, cookies=cookies)
+        self.progress = progress
         self.website_bridge = WebsiteBridge(website, progress)
         self.return_images = return_images
         self.return_executor = ThreadPoolExecutor(max_workers=1)
@@ -155,6 +156,7 @@ class JsonLoggerClient(ZaloAPI):
         }
         print(json.dumps(event, ensure_ascii=False, indent=2, default=str), flush=True)
         print()
+        self.progress.record_log(event)
         return_callback = None
         if self.return_images and isinstance(message, ImageGroup):
             def return_callback(images, result):

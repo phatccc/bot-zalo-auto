@@ -201,6 +201,7 @@ class PendingBatch:
     images: list[str] = field(default_factory=list)
     price_text: str | None = None
     return_callback: Callable[[list[tuple[bytes, str]], dict[str, Any]], None] | None = None
+    reported_mismatch: str | None = None
 
 
 class WebsiteBridge:
@@ -240,6 +241,15 @@ class WebsiteBridge:
                 batch.return_callback = return_callback
             prices = parse_prices(batch.price_text or "")
             print(f"[BATCH] {key[0]}: {len(batch.images)} ảnh / {len(prices)} giá", flush=True)
+            if len(batch.images) >= 2 and len(prices) >= 2 and len(batch.images) != len(prices):
+                signature = f"{len(batch.images)}:{len(prices)}"
+                if batch.reported_mismatch != signature:
+                    self.progress.record_issue(
+                        "Số lượng ảnh và giá không khớp",
+                        f"Người gửi {batch.sender_name}: {len(batch.images)} ảnh nhưng có {len(prices)} giá. Batch được giữ lại để chờ dữ liệu khớp.",
+                        severity="warning",
+                    )
+                    batch.reported_mismatch = signature
             if len(batch.images) < 2 or len(prices) < 2 or len(batch.images) != len(prices):
                 return
             batch = self.batches.pop(key)
@@ -358,6 +368,7 @@ class WebsiteBridge:
         required = ("supabase_url", "supabase_service_key", "cloudinary_cloud_name", "cloudinary_upload_preset")
         if any(not self.settings.get(key) for key in required):
             print("[BATCH] Thiếu cấu hình Supabase/Cloudinary trong website.js.", flush=True)
+            self.progress.record_issue("Thiếu cấu hình website", "Không thể cập nhật list vì website.js thiếu Supabase hoặc Cloudinary.")
             return
         prices = [raised_price(value) for value in parse_prices(batch.price_text or "")]
         base = str(self.settings["supabase_url"]).rstrip("/") + "/rest/v1"
@@ -368,6 +379,7 @@ class WebsiteBridge:
             owner = self.resolve_account_owner(base)
         except (ValueError, requests.RequestException) as error:
             print(f"[BATCH] Không đọc được owner nội bộ của web: {error}", flush=True)
+            self.progress.record_issue("Không đọc được owner web", str(error), batch_id=batch_id, severity="warning")
             owner = None
         tasks = []
         for position, (source_url, price) in enumerate(zip(batch.images, prices), start=1):
@@ -382,6 +394,7 @@ class WebsiteBridge:
             # Retain the old per-item query path if the accelerated lookup is
             # temporarily unavailable, so no storage logic is lost.
             print(f"[BATCH] Không kiểm tra nhanh được account cũ, dùng chế độ dự phòng: {error}", flush=True)
+            self.progress.record_issue("Kiểm tra account cũ chậm", str(error), batch_id=batch_id, severity="warning")
             existing_ids = None
 
         # Downloads, Cloudinary uploads, and independent account rows can run in
@@ -418,6 +431,11 @@ class WebsiteBridge:
                 except (KeyError, OSError, ValueError, requests.RequestException, RuntimeError) as error:
                     print(f"[BATCH] Bỏ ảnh vị trí {position} (giá {format_vnd(price)}): {error}", flush=True)
                     self.progress.update_item(batch_id, position, "Lỗi", str(error))
+                    self.progress.record_issue(
+                        f"Không cập nhật được ảnh {position}",
+                        f"Giá {format_vnd(price)}: {error}",
+                        batch_id=batch_id,
+                    )
                 self.progress.update_batch(
                     batch_id,
                     "Đang xử lý ảnh",
@@ -427,6 +445,7 @@ class WebsiteBridge:
         returned = [completed[position] for position, _, _, _ in tasks if position in completed]
         if not returned:
             self.progress.update_batch(batch_id, "Thất bại: không có ảnh cập nhật", success=0, failed=len(tasks), done=True)
+            self.progress.record_issue("Batch không cập nhật được ảnh nào", "Toàn bộ ảnh trong list thất bại. Xem lỗi từng ảnh để xử lý.", batch_id=batch_id)
             print("[BATCH] Không ảnh nào được cập nhật, không trả album.", flush=True)
             return
         owner_status = "đã gán" if owner else "chưa tìm thấy"
