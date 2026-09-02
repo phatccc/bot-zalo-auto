@@ -137,8 +137,10 @@ class JsonLoggerClient(ZaloAPI):
         if not destination or str(author_id) != destination:
             self.send(Message(text="Lệnh /timchu chỉ dùng cho chủ bot."), thread_id, thread_type)
             return
-        self.owner_search_requests[(str(author_id), str(thread_id))] = time.monotonic() + 180
+        # Lưu theo author_id để nhận ảnh từ bất kỳ conversation nào (group hoặc riêng).
+        self.owner_search_requests[str(author_id)] = time.monotonic() + 180
         self.send(Message(text="🔎 Gửi 1 ảnh cần tìm chủ acc trong 3 phút."), thread_id, thread_type)
+        print("[TIMCHU] Đã kích hoạt tìm kiếm, hết hạn sau 3 phút.", flush=True)
 
     def _find_owner_from_image(self, image_url, destination):
         try:
@@ -184,17 +186,32 @@ class JsonLoggerClient(ZaloAPI):
         }
         print(json.dumps(event, ensure_ascii=False, indent=2, default=str), flush=True)
         print()
-        search_key = (str(author_id), str(thread_id))
+        # Trường hợp 1: tin nhắn text "/timchu"
         if isinstance(message, str) and message.strip().casefold() == "/timchu":
             self._start_owner_search(author_id, thread_id, thread_type)
             return
+        # Trường hợp 2: gửi ảnh kèm caption "/timchu" (chat.photo với title="/timchu")
+        photo_caption = (message.get("title") or "") if isinstance(message, dict) else ""
+        photo_url = (message.get("href") or "") if isinstance(message, dict) else ""
+        if photo_caption.strip().casefold() == "/timchu" and photo_url:
+            destination = str(self.website_bridge.settings.get("notification_chat_id") or "").strip()
+            if not destination or str(author_id) != destination:
+                self.send(Message(text="Lệnh /timchu chỉ dùng cho chủ bot."), thread_id, thread_type)
+                return
+            print("[TIMCHU] Nhận ảnh kèm caption /timchu, đang tìm chủ acc...", flush=True)
+            self.owner_search_executor.submit(self._find_owner_from_image, photo_url, destination)
+            return
+        # Trường hợp 3: đang chờ ảnh sau khi gửi /timchu dạng text trước đó.
+        search_key = str(author_id)
         expires_at = self.owner_search_requests.get(search_key)
         urls = image_urls(message)
         if expires_at and expires_at <= time.monotonic():
+            print("[TIMCHU] Phiên tìm kiếm đã hết hạn.", flush=True)
             self.owner_search_requests.pop(search_key, None)
         elif expires_at and urls:
             self.owner_search_requests.pop(search_key, None)
             destination = str(self.website_bridge.settings.get("notification_chat_id") or "").strip()
+            print("[TIMCHU] Nhận ảnh, đang tìm chủ acc...", flush=True)
             self.owner_search_executor.submit(self._find_owner_from_image, urls[0], destination)
             return
         return_callback = None
