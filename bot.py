@@ -135,7 +135,8 @@ class JsonLoggerClient(ZaloAPI):
     def _start_owner_search(self, author_id, thread_id, thread_type):
         destination = str(self.website_bridge.settings.get("notification_chat_id") or "").strip()
         if not destination or str(author_id) != destination:
-            self.send(Message(text="Lệnh /timchu chỉ dùng cho chủ bot."), thread_id, thread_type)
+            # `/timchu` is private to the configured owner.  Other users are
+            # intentionally ignored rather than receiving a permission reply.
             return
         # Lưu theo author_id để nhận ảnh từ bất kỳ conversation nào (group hoặc riêng).
         self.owner_search_requests[str(author_id)] = time.monotonic() + 180
@@ -196,7 +197,7 @@ class JsonLoggerClient(ZaloAPI):
         if photo_caption.strip().casefold() == "/timchu" and photo_url:
             destination = str(self.website_bridge.settings.get("notification_chat_id") or "").strip()
             if not destination or str(author_id) != destination:
-                self.send(Message(text="Lệnh /timchu chỉ dùng cho chủ bot."), thread_id, thread_type)
+                # Keep the private command silent for everyone except owner.
                 return
             print("[TIMCHU] Nhận ảnh kèm caption /timchu, đang tìm chủ acc...", flush=True)
             self.owner_search_executor.submit(self._find_owner_from_image, photo_url, destination)
