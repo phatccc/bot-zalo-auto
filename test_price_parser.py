@@ -81,6 +81,14 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
     def test_missing_account_placeholder_keeps_image_position(self):
         self.assertEqual(parse_prices("13m - 12 m - bay"), [13_000_000, 12_000_000, MISSING_ACCOUNT_PRICE])
         self.assertEqual(parse_prices("13m\nbay\n12m"), [13_000_000, MISSING_ACCOUNT_PRICE, 12_000_000])
+        self.assertEqual(parse_prices("13m - sold - 14m\n12m - dabay - 15m"), [
+            13_000_000, MISSING_ACCOUNT_PRICE, 14_000_000,
+            12_000_000, MISSING_ACCOUNT_PRICE, 15_000_000,
+        ])
+        self.assertEqual(parse_prices("10m - đã bay - 11m\n12m - đã bán - 13m"), [
+            10_000_000, MISSING_ACCOUNT_PRICE, 11_000_000,
+            12_000_000, MISSING_ACCOUNT_PRICE, 13_000_000,
+        ])
         self.assertEqual(parse_prices("nick bay rồi"), [])
         self.assertEqual(raised_price(MISSING_ACCOUNT_PRICE), MISSING_ACCOUNT_PRICE)
         self.assertEqual(format_price_badge(MISSING_ACCOUNT_PRICE), "999m")

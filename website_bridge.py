@@ -25,7 +25,10 @@ def price_text_without_owner(text: str) -> str:
 
 
 PRICE_TOKEN = re.compile(r"^(?:\d+(?:[.,]\d+)?(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)?|\d{1,3}(?:[.,]\d{3})+)$", re.I)
-MISSING_ACCOUNT_TOKENS = {"bay"}
+# Status words occupy an image position even though the account is no longer
+# available.  Treat them as the same 999m placeholder so later image/price
+# pairs never shift (for example: `13m - sold - 14m`).
+MISSING_ACCOUNT_TOKENS = {"bay", "sold", "dabay", "daban", "banroi", "out"}
 # These are common sale qualifiers, not account-description words.  They are
 # accepted only after a price-only line has otherwise been identified, keeping
 # ordinary messages with numbers from starting a batch accidentally.
@@ -64,6 +67,11 @@ def parse_prices(text: str) -> list[int]:
     raw_tokens: list[str] = []
     has_real_price = False
     for line in price_text_without_owner(text).splitlines():
+        # Sellers use both Vietnamese and English status words between prices.
+        # Normalize multi-word status labels before splitting the price row.
+        line = re.sub(r"\b(?:đã|da)\s*[-_.]?\s*bay\b", "bay", line, flags=re.I)
+        line = re.sub(r"\b(?:đã|da)\s*[-_.]?\s*bán\b", "daban", line, flags=re.I)
+        line = re.sub(r"\bbán\s*[-_.]?\s*rồi\b|\bban\s*[-_.]?\s*roi\b", "banroi", line, flags=re.I)
         # Some sellers omit the final `)` in notes like `27 (VNG`; annotations
         # must not make that otherwise valid price disappear.
         line = re.sub(r"\([^)]*(?:\)|$)|\[[^]]*(?:\]|$)", " ", line).strip()
