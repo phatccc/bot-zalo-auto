@@ -1,5 +1,5 @@
 # -*- coding: UTF-8 -*-
-import requests, json
+import requests
 
 from . import _util, _exception
 
@@ -50,6 +50,10 @@ class State(object):
 	
 	def is_logged_in(cls):
 		return cls._loggedin
+
+	@property
+	def user_id(cls):
+		return cls._config.get("send2me_id")
 	
 	def login(cls, phone, password, imei, session_cookies=None, user_agent=None):
 		if cls._cookies and cls._config.get("secret_key"):
@@ -60,9 +64,6 @@ class State(object):
 			cls._headers["User-Agent"] = user_agent
 			
 		if cls._cookies:
-			params = {
-				"imei": imei,
-			}
 			try:
 				url = f"https://wpa.chat.zalo.me/api/login/getLoginInfo?imei={imei}&type=30&client_version=645&computer_name=Web&ts={_util.now()}"
 				response = requests.get(url, headers=headers, cookies=cls._cookies)

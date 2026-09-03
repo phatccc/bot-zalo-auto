@@ -1,14 +1,35 @@
 import io
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 import requests
+from zlapi import ImageGroup, ZaloAPI
+from zlapi.models import ThreadType
 
 from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, image_signature, parse_prices, prices_for_image_count, priced_image, raised_price, retry, signature_similarity, verified_image_content
 
 
 class PriceParserTests(unittest.TestCase):
+    def test_zlapi_v110_groups_camelcase_album_once_in_order(self):
+        class Collector(ZaloAPI):
+            def __init__(self):
+                super().__init__(auto_login=False)
+                self.received = []
+
+            def onMessage(self, mid, author_id, message, message_object, thread_id, thread_type):
+                self.received.append(message)
+
+        client = Collector()
+        first = SimpleNamespace(href="https://example.invalid/first.jpg", params='{"isGroupLayout":1,"groupLayoutId":"album-1","idInGroup":0,"totalItemInGroup":2}')
+        second = SimpleNamespace(href="https://example.invalid/second.jpg", params='{"isGroupLayout":1,"groupLayoutId":"album-1","idInGroup":1,"totalItemInGroup":2}')
+        client._handle_incoming_message("1", "sender", first, SimpleNamespace(), "thread", ThreadType.GROUP)
+        client._handle_incoming_message("2", "sender", second, SimpleNamespace(), "thread", ThreadType.GROUP)
+        self.assertEqual(len(client.received), 1)
+        self.assertIsInstance(client.received[0], ImageGroup)
+        self.assertEqual([image.href for image in client.received[0].images], [first.href, second.href])
+
     def test_real_price_list_with_provider_notes(self):
         text = """Chủ: Phạm Kính
 Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha

@@ -7,7 +7,7 @@ from .models import *
 from ._client import ZaloAPI
 
 __title__ = "zlapi"
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 __description__ = "Zalo API (Website) for Python"
 
 __copyright__ = "Copyright 2024 by Vexx"
@@ -15,4 +15,4 @@ __copyright__ = "Copyright 2024 by Vexx"
 __author__ = "Lê Quốc Việt"
 __email__ = "vrxxdev@gmail.com"
 
-__all__ = ["ZaloAPI", "ImageGroup"]
+__all__ = ["ZaloAPI", "ImageGroup", "ImageSendFailure", "MultiImageSendResult"]

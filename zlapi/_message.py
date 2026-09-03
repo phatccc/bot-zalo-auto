@@ -1,7 +1,6 @@
 import json
 
 from . import _util
-from ._core import Enum
 from ._parse_message import Parse
 
 class Message:
@@ -63,7 +62,7 @@ class MessageStyle:
 		self.offset = offset
 		self.length = length
 		self.style = style
-		if type(offset) != int and type(length) != int:
+		if not isinstance(offset, int) or not isinstance(length, int):
 			raise ValueError("Invalid Length, Offset! Length and Offset must be integers")
 		
 		if style == "bold":
@@ -120,7 +119,7 @@ class MessageReaction:
 		self.msgId = messageObject.msgId
 		self.cliMsgId = messageObject.cliMsgId
 		self.msgType = _util.getClientMessageType(messageObject.msgType)
-		if not isinstance(msgType, int):
+		if not isinstance(self.msgType, int):
 			raise ValueError("Msg Type must be int")
 		
 		if auto_format:
@@ -146,7 +145,7 @@ class Mention:
 		self.offset = offset
 		self.length = length
 		self.type = 1 if uid == "-1" else 0
-		if type(offset) != int and type(length) != int:
+		if not isinstance(offset, int) or not isinstance(length, int):
 			raise ValueError("Invalid Length, Offset! Length and Offset must be integers")
 		
 		if auto_format:

@@ -10,8 +10,10 @@ import struct
 import threading
 import time
 import traceback
+from collections import OrderedDict
 
 import websocket
+from PIL import Image
 
 from .models import *
 from . import _util, _state
@@ -20,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 pool = ThreadPoolExecutor()
 logger = logging.getLogger(__name__)
+IMAGE_GROUP_CACHE_TTL = 15 * 60
+IMAGE_GROUP_CACHE_MAX_SIZE = 1024
 if not logging.root.handlers:
 	logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -33,7 +37,7 @@ class ZaloAPI(object):
 			password (str): Zalo account password
 			auto_login (bool): Automatically log in when initializing ZaloAPI (Default: True)
 			user_agent (str): Custom user agent to use when sending requests. If `None`, user agent will be chosen from a premade list
-			session_cookies (dict): Cookies from a previous session (Required if logging in with cookies)
+			cookies (dict): Cookies from a previous session (required for cookie login). Loading cookies does not log in; ``login(imei=...)`` binds IMEI and websocket.
 			
 		Raises:
 			ZaloLoginError: On failed login
@@ -42,12 +46,11 @@ class ZaloAPI(object):
 		self.user_id = None
 		self.cloud_id = None
 		
-		self._condition = threading.Event()
 		self._state = _state.State()
 		self._listening = False
 		self.thread = False
 		self._image_groups = {}
-		self._completed_image_groups = set()
+		self._completed_image_groups = OrderedDict()
 		self._image_groups_lock = threading.Lock()
 		
 		if auto_login:
@@ -80,53 +83,78 @@ class ZaloAPI(object):
 		else:
 			self.onMessage(mid, author_id, message, message_object, thread_id, thread_type)
 
-	def _parse_image_group_details(self, message):
-		"""Return album metadata for a grouped image message, otherwise ``None``."""
-		params = getattr(message, "params", None)
+	def _parse_image_group_details(self, message, message_object=None):
+		"""Return album metadata for a grouped image message, otherwise ``None``.
+
+		Accepts snake_case chat payloads and camelCase Zalo Cloud fields on the
+		message, the raw ``message_object``, or ``message_object.content``.
+		"""
+		candidates = [message, message_object]
+		if message_object is not None:
+			candidates.append(getattr(message_object, "content", None))
+		for candidate in candidates:
+			details = self._layout_from_payload(candidate)
+			if details is not None:
+				return details
+		return None
+
+	def _layout_from_payload(self, payload):
+		if payload is None:
+			return None
+		if isinstance(payload, dict):
+			params = payload.get("params")
+		else:
+			params = getattr(payload, "params", None)
 		if isinstance(params, str):
 			try:
 				params = json.loads(params)
 			except (TypeError, ValueError):
 				return None
-
-		if not isinstance(params, dict) or not params.get("is_group_layout"):
+		if not isinstance(params, dict):
 			return None
-
+		if not params.get("is_group_layout") and not params.get("isGroupLayout"):
+			return None
 		try:
-			group_id = params["group_layout_id"]
-			position = int(params["id_in_group"])
-			total = int(params["total_item_in_group"])
-		except (KeyError, TypeError, ValueError):
+			group_id = params.get("group_layout_id", params.get("groupLayoutId"))
+			position = int(params.get("id_in_group", params.get("idInGroup")))
+			total = int(params.get("total_item_in_group", params.get("totalItemInGroup")))
+		except (TypeError, ValueError):
 			return None
-
-		if total <= 0 or position < 0 or position >= total:
+		if group_id is None or total <= 0 or position < 0 or position >= total:
 			return None
 		return group_id, position, total
 
 	def _handle_incoming_message(self, mid, author_id, message, message_object, thread_id, thread_type):
 		"""Buffer grouped images and emit a completed album once, in display order."""
-		details = self._parse_image_group_details(message)
+		details = self._parse_image_group_details(message, message_object)
 		if details is None:
 			self._emit_message(mid, author_id, message, message_object, thread_id, thread_type)
 			return
 
 		group_id, position, total = details
 		key = (str(thread_id), str(author_id), str(group_id))
+		current_time = time.monotonic()
 		with self._image_groups_lock:
+			self._prune_image_groups(current_time)
 			if key in self._completed_image_groups:
 				return
 
-			group = self._image_groups.setdefault(key, {"total": total, "items": {}})
+			group = self._image_groups.setdefault(
+				key, {"total": total, "items": {}, "created_at": current_time}
+			)
 			if group["total"] != total:
 				return
 
 			group["items"].setdefault(position, (mid, message, message_object))
-			if len(group["items"]) != total or set(group["items"]) != set(range(total)):
+			if len(group["items"]) != total or any(index not in group["items"] for index in range(total)):
 				return
 
 			ordered_items = [group["items"][index] for index in range(total)]
 			del self._image_groups[key]
-			self._completed_image_groups.add(key)
+			self._completed_image_groups[key] = current_time
+			self._completed_image_groups.move_to_end(key)
+			while len(self._completed_image_groups) > IMAGE_GROUP_CACHE_MAX_SIZE:
+				self._completed_image_groups.popitem(last=False)
 
 		first_mid, _, _ = ordered_items[0]
 		image_group = ImageGroup(
@@ -142,6 +170,18 @@ class ZaloAPI(object):
 			thread_id,
 			thread_type,
 		)
+
+	def _prune_image_groups(self, current_time):
+		"""Remove expired image albums. Must be called with ``_image_groups_lock`` held."""
+		expired_before = current_time - IMAGE_GROUP_CACHE_TTL
+		for key, group in list(self._image_groups.items()):
+			if group["created_at"] < expired_before:
+				del self._image_groups[key]
+		while self._completed_image_groups:
+			_, completed_at = next(iter(self._completed_image_groups.items()))
+			if completed_at >= expired_before:
+				break
+			self._completed_image_groups.popitem(last=False)
 	
 	"""
 	END INTERNAL REQUEST METHODS
@@ -182,26 +222,22 @@ class ZaloAPI(object):
 		return self._state.get_cookies()
 		
 	def setSession(self, session_cookies):
-		"""Load session cookies.
-		
-		Warning:
-			Error sending requests if session cookie is wrong
-			
+		"""Load HTTP session cookies. This does not log in.
+
+		Call ``login(imei=...)`` afterwards to bind the device IMEI and fetch
+		the websocket key. ``user_id`` stays unset until that login succeeds.
+
 		Args:
-			session_cookies (dict): A dictionary containing session cookies
-			
+			session_cookies (dict): A non-empty dictionary of session cookies
+
 		Returns:
-			Bool: False if ``session_cookies`` does not contain proper cookies
+			bool: False if ``session_cookies`` is not a non-empty dict
 		"""
-		try:
-			if not isinstance(session_cookies, dict):
-				return False
-			
-			self._state.set_cookies(session_cookies)
-			self.user_id = self._state.user_id
-		except Exception as e:
+		if not isinstance(session_cookies, dict) or not session_cookies:
 			return False
-		
+
+		self._state.set_cookies(session_cookies)
+		self.user_id = self._state.user_id
 		return True
 	
 	def getSecretKey(self):
@@ -232,19 +268,21 @@ class ZaloAPI(object):
 			return False
 	
 	def login(self, phone=None, password=None, imei=None, user_agent=None):
-		"""Login the user, using ``phone`` and ``password``.
-			
-		If the user is already logged in, this will do a re-login.
-				
+		"""Log in with cookies already loaded via ``setSession`` (or constructor ``cookies``).
+
+		Binds ``imei`` and fetches the websocket key via ``getLoginInfo``.
+		Phone/password login is not implemented; missing cookies raise
+		``LoginMethodNotSupport``. If already logged in, this re-logins.
+
 		Args:
-			imei (str): The device imei is logged into Zalo
-			phone (str): Zalo account phone number
-			password (str): Zalo account password
-			user_agent (str): Custom user agent to use when sending requests. If `None`, user agent will be chosen from a premade list
-			
+			imei (str): Device IMEI to bind for this Zalo session
+			phone (str): Unused; phone/password login is not supported
+			password (str): Unused; phone/password login is not supported
+			user_agent (str): Custom user agent. If ``None``, a default is used
+
 		Raises:
 			ZaloLoginError: On failed login
-			LoginMethodNotSupport: If method login not support
+			LoginMethodNotSupport: If no session cookies are loaded
 		"""
 		self.onLoggingIn("using Cookies") if self.getSession() else self.onLoggingIn(phone)
 		
@@ -254,12 +292,12 @@ class ZaloAPI(object):
 			imei,
 			user_agent=user_agent
 		)
+		self._imei = self._state.user_imei
+		self.cloud_id = self._state.cloud_id
 		try:
-			self._imei = self._state.user_imei
 			self.user_id = self.fetchAccountInfo().profile.get("userId")
-			self.cloud_id = self._state.cloud_id
-		except:
-			self._imei = None
+		except Exception:
+			logger.warning("Could not fetch account info after login; user_id is unset", exc_info=True)
 		
 		self.onLoggedIn(self._state._config.get("phone_number"))
 		
@@ -289,9 +327,8 @@ class ZaloAPI(object):
 		if not os.path.exists(filePath):
 			raise ZaloUserError(f"{filePath} not found")
 			
-		files = [("chunkContent", open(filePath, "rb"))]
-		fileSize = len(open(filePath, "rb").read())
-		fileName = filePath if "/" not in filePath else filePath.rstrip("/")[1]
+		fileSize = os.path.getsize(filePath)
+		fileName = os.path.basename(filePath)
 		
 		params = {
 			"params": {
@@ -321,7 +358,8 @@ class ZaloAPI(object):
 		
 		params["params"] = self._encode(params["params"])
 		
-		response = self._post(url, params=params, files=files)
+		with open(filePath, "rb") as file_handle:
+			response = self._post(url, params=params, files=[("chunkContent", file_handle)])
 		data = response.json()
 		results = data.get("data") if data.get("error_code") == 0 else None
 		if results:
@@ -3361,78 +3399,123 @@ class ZaloAPI(object):
 		error_message = data.get("error_message") or data.get("data")
 		raise ZaloAPIException(f"Error #{error_code} when sending requests: {error_message}")
 	
-	def sendMultiLocalImage(self, imagePathList, thread_id, thread_type, width=2560, height=2560, message=None, ttl=0):
+	def _buildMultiLocalImagePayload(self, uploadImage, thread_id, thread_type, width, height, message, ttl, groupLayoutId, totalItemInGroup, idInGroup):
+		"""Build one unencoded payload for a prepared image in an album."""
+		payload = {
+			"params": {
+				"photoId": uploadImage.get("photoId", int(_util.now() * 2)),
+				"clientId": uploadImage.get("clientFileId", int(_util.now() - 1000)),
+				"desc": message.text if message else "" or "",
+				"width": width,
+				"height": height,
+				"groupLayoutId": groupLayoutId,
+				"totalItemInGroup": totalItemInGroup,
+				"isGroupLayout": 1,
+				"idInGroup": idInGroup,
+				"rawUrl": uploadImage["normalUrl"],
+				"thumbUrl": uploadImage["thumbUrl"],
+				"hdUrl": uploadImage["hdUrl"],
+				"thumbSize": "53932",
+				"fileSize": "247671",
+				"hdSize": "344622",
+				"zsource": -1,
+				"jcp": json.dumps({"sendSource": 1, "convertible": "jxl"}),
+				"ttl": ttl,
+				"imei": self._imei,
+			}
+		}
+
+		if message and message.mention:
+			payload["params"]["mentionInfo"] = message.mention
+
+		if thread_type == ThreadType.USER:
+			payload["params"]["toid"] = str(thread_id)
+			payload["params"]["normalUrl"] = uploadImage["normalUrl"]
+		elif thread_type == ThreadType.GROUP:
+			payload["params"]["grid"] = str(thread_id)
+			payload["params"]["oriUrl"] = uploadImage["normalUrl"]
+		else:
+			raise ZaloUserError("Thread type is invalid")
+
+		return payload
+
+	def sendMultiLocalImage(self, imagePathList, thread_id, thread_type, width=None, height=None, message=None, ttl=0):
 		"""Send Multiple Image to a User/Group with local file.
 			
 		Args:
 			imagePathList (list): List image directory to send
-			width (int): Image width to send
-			height (int): Image height to send
+			width (int | None): Override width for every image. Provide together with ``height``.
+			height (int | None): Override height for every image. Provide together with ``width``.
 			message (Message): Message to send with image
 			thread_id (int | str): User/Group ID to send to.
 			thread_type (ThreadType): ThreadType.USER, ThreadType.GROUP
 			
 		Returns:
-			object: `User/Group` objects
-			dict: A dictionary containing error responses
+			MultiImageSendResult: Successful responses and failures for individual images.
 		
 		Raises:
 			ZaloAPIException: If request failed
 		"""
-		uploadData = []
-		
 		if not isinstance(imagePathList, list) or len(imagePathList) < 1:
 			raise ZaloUserError("image path must be a list to be able to send multiple at once.")
-		
+
+		if (width is None) != (height is None):
+			raise ZaloUserError("width and height must be provided together.")
+		if thread_type not in (ThreadType.USER, ThreadType.GROUP):
+			raise ZaloUserError("Thread type is invalid")
+
+		failed = []
+		prepared = []
+		for index, imagePath in enumerate(imagePathList):
+			try:
+				if width is None:
+					with Image.open(imagePath) as image:
+						imageWidth, imageHeight = image.size
+				else:
+					imageWidth, imageHeight = width, height
+			except Exception as error:
+				failed.append(ImageSendFailure(index, imagePath, "dimension", str(error)))
+				continue
+
+			try:
+				uploadImage = self._uploadImage(imagePath, thread_id, thread_type)
+			except Exception as error:
+				failed.append(ImageSendFailure(index, imagePath, "upload", str(error)))
+				continue
+
+			prepared.append((index, imagePath, uploadImage, imageWidth, imageHeight))
+
+		if not prepared:
+			return MultiImageSendResult(sent=[], failed=failed)
+
 		groupLayoutId = str(_util.now())
-		
-		for i, imagePath in enumerate(imagePathList):
-			uploadImage = self._uploadImage(imagePath, thread_id, thread_type)
-		
-			payload = {
-				"params": {
-					"photoId": uploadImage.get("photoId", int(_util.now() * 2)),
-					"clientId": uploadImage.get("clientFileId", int(_util.now() - 1000)),
-					"desc": message.text if message else "" or "",
-					"width": width,
-					"height": height,
-					"groupLayoutId": groupLayoutId,
-					"totalItemInGroup": len(imagePathList),
-					"isGroupLayout": 1,
-					"idInGroup": i,
-					"rawUrl": uploadImage["normalUrl"],
-					"thumbUrl": uploadImage["thumbUrl"],
-					"hdUrl": uploadImage["hdUrl"],
-					"thumbSize": "53932",
-					"fileSize": "247671",
-					"hdSize": "344622",
-					"zsource": -1,
-					"jcp": json.dumps({"sendSource": 1, "convertible": "jxl"}),
-					"ttl": ttl,
-					"imei": self._imei
-				}
-			}
-		
-			if message and message.mention:
-				payload["params"]["mentionInfo"] = message.mention
-			
-			if thread_type == ThreadType.USER:
-				payload["params"]["toid"] = str(thread_id)
-				payload["params"]["normalUrl"] = uploadImage["normalUrl"]
-			elif thread_type == ThreadType.GROUP:
-				payload["params"]["grid"] = str(thread_id)
-				payload["params"]["oriUrl"] = uploadImage["normalUrl"]
-			else:
-				raise ZaloUserError("Thread type is invalid")
-			
-			data = self.sendLocalImage(imagePath, thread_id, thread_type, width, height, message, custom_payload=payload)
-			uploadData.append(data.toDict())
-		
-		return (
-			Group.fromDict(uploadData, None) 
-			if thread_type == ThreadType.GROUP else 
-			User.fromDict(uploadData, None)
-		)
+		totalItemInGroup = len(prepared)
+		sent = []
+		for idInGroup, (index, imagePath, uploadImage, imageWidth, imageHeight) in enumerate(prepared):
+			for attempt in range(2):
+				payload = self._buildMultiLocalImagePayload(
+					uploadImage, thread_id, thread_type, imageWidth, imageHeight, message, ttl,
+					groupLayoutId, totalItemInGroup, idInGroup,
+				)
+				try:
+					sent.append(self.sendLocalImage(
+						imagePath, thread_id, thread_type, imageWidth, imageHeight, message,
+						custom_payload=payload, ttl=ttl,
+					))
+					break
+				except Exception as error:
+					if attempt == 1:
+						failed.append(ImageSendFailure(index, imagePath, "send", str(error)))
+						for remainingIndex, remainingPath, _, _, _ in prepared[idInGroup + 1:]:
+							failed.append(ImageSendFailure(
+								remainingIndex,
+								remainingPath,
+								"send",
+								"Not attempted because a previous image could not be sent.",
+							))
+						return MultiImageSendResult(sent=sent, failed=failed)
+
+		return MultiImageSendResult(sent=sent, failed=failed)
 	
 	def sendLocalGif(self, gifPath, thumbnailUrl, thread_id, thread_type, gifName="vrxx.gif", width=500, height=500, ttl=0):
 		"""Send Gif to a User/Group with local file.
@@ -3456,10 +3539,13 @@ class ZaloAPI(object):
 		if not os.path.exists(gifPath):
 			raise ZaloUserError(f"{gifPath} not found")
 			
-		files = [("chunkContent", open(gifPath, "rb"))]
-		gifSize = len(open(gifPath, "rb").read())
-		gifName = gifName if gifName else gifPath if "/" not in gifPath else gifPath.rstrip("/")[1]
-		fileChecksum = hashlib.md5(open(gifPath, "rb").read()).hexdigest()
+		gifSize = os.path.getsize(gifPath)
+		gifName = gifName or os.path.basename(gifPath)
+		checksum = hashlib.md5()
+		with open(gifPath, "rb") as gif_file:
+			for chunk in iter(lambda: gif_file.read(64 * 1024), b""):
+				checksum.update(chunk)
+		fileChecksum = checksum.hexdigest()
 		
 		params = {
 			"zpw_ver": 647,
@@ -3493,7 +3579,8 @@ class ZaloAPI(object):
 		
 		params["params"] = self._encode(params["params"])
 		
-		response = self._post(url, params=params, files=files)
+		with open(gifPath, "rb") as gif_file:
+			response = self._post(url, params=params, files=[("chunkContent", gif_file)])
 		data = response.json()
 		results = data.get("data") if data.get("error_code") == 0 else None
 		if results:
@@ -4122,9 +4209,8 @@ class ZaloAPI(object):
 	"""
 	LISTEN METHODS
 	"""
-	
+
 	def _listen(self, thread=False, reconnect=5):
-		self._condition.clear()
 		params = {"zpw_ver": 647, "zpw_type": 30, "t": _util.now()}
 		url = self._state._config["zpw_ws"][0] + "?" + urlencode(params)
 
@@ -4150,12 +4236,15 @@ class ZaloAPI(object):
 		}
 
 		def on_open(ws):
-			self.listening = True
+			self._listening = True
 			self.onListening()
-		
-		
+
+
 		def on_close(ws, status_code, msg):
-			pass
+			self._listening = False
+			if getattr(self, "ping_interval", None):
+				self.ping_interval.cancel()
+				self.ping_interval = None
 		
 		
 		def on_error(ws, error):
@@ -4176,14 +4265,10 @@ class ZaloAPI(object):
 				encodedHeader = data[:4]
 				version, cmd, subCmd = _util.getHeader(encodedHeader)
 				
-				dataToDecode = data[4:]
-				decodedData = dataToDecode.decode("utf-8")
+				decodedData = data[4:].decode("utf-8")
 				if not decodedData or "eventId" in decodedData:
 					return
-				
-				if not isinstance(decodedData, dict):
-					parsed = json.loads(decodedData)
-				
+
 				parsed = json.loads(decodedData)
 				
 				if version == 1 and cmd == 1 and subCmd == 1 and "key" in parsed:
@@ -4206,7 +4291,6 @@ class ZaloAPI(object):
 					os.kill(pid, signal.SIGTERM)
 				
 				elif version == 1 and cmd == 501 and subCmd == 0:
-					parsedData = _util.zws_decode(parsed, self.ws_key)
 					userMsgs = parsedData["data"]["msgs"]
 					
 					for message in userMsgs:
@@ -4215,16 +4299,20 @@ class ZaloAPI(object):
 				
 				elif version == 1 and cmd == 521 and subCmd == 0:
 					groupMsgs = parsedData["data"]["groupMsgs"]
-					
-					try:
-						for message in groupMsgs:
-							messages = self.getRecentGroup(message["idTo"])["groupMsgs"]
-							message = next((msg for msg in messages if msg["msgId"] == message["msgId"]), message)
-					except:
-						pass
-						
-					msgObj = MessageObject.fromDict(message, None)
-					self._handle_incoming_message(msgObj.msgId, str(int(msgObj.uidFrom) or self.user_id), msgObj.content, msgObj, str(int(msgObj.idTo) or self.user_id), ThreadType.GROUP)
+					recent_messages = {}
+					for group_id in {message.get("idTo") for message in groupMsgs}:
+						try:
+							recent_messages[group_id] = {
+								message["msgId"]: message
+								for message in self.getRecentGroup(group_id).get("groupMsgs", [])
+							}
+						except Exception as error:
+							logger.debug("Unable to enrich group messages for %s: %s", group_id, error)
+
+					for message in groupMsgs:
+						message = recent_messages.get(message.get("idTo"), {}).get(message["msgId"], message)
+						msgObj = MessageObject.fromDict(message, None)
+						self._handle_incoming_message(msgObj.msgId, str(int(msgObj.uidFrom) or self.user_id), msgObj.content, msgObj, str(int(msgObj.idTo) or self.user_id), ThreadType.GROUP)
 				
 				elif version == 1 and cmd == 601 and subCmd == 0:
 					controls = parsedData["data"].get("controls", [])
@@ -4237,12 +4325,10 @@ class ZaloAPI(object):
 							groupEventData = json.loads(control["content"]["data"]) if isinstance(control["content"]["data"], str) else control["content"]["data"]
 							groupEventType = _util.getGroupEventType(control["content"]["act"])
 							event_data = EventObject.fromDict(groupEventData)
-							event_type = groupEventType
-							[
-								pool.submit(self.onEvent, event_data, event_type)
-								if self.thread else
-								self.onEvent(event_data, event_type)
-							]
+							if self.thread:
+								pool.submit(self.onEvent, event_data, groupEventType)
+							else:
+								self.onEvent(event_data, groupEventType)
 				
 				elif cmd == 612:
 					reacts = parsedData["data"].get("reacts", [])
@@ -4289,7 +4375,6 @@ class ZaloAPI(object):
 		}
 		
 		encoded_data = json.dumps(payload["data"]).encode()
-		data_length = len(encoded_data)
 		header = struct.pack("<BIB", payload["version"], payload["cmd"], payload["subCmd"])
 		data = header + encoded_data
 		self.ws.send(data, websocket.ABNF.OPCODE_BINARY)
@@ -4408,13 +4493,15 @@ class ZaloAPI(object):
 			)
 		)
 	
-	def onErrorCallBack(self, error, ts=int(time.time())):
+	def onErrorCallBack(self, error, ts=None):
 		"""Called when the module has some error.
 		
 		Args:
 			error: Description of the error
 			ts: A timestamp of the error (Default: auto)
 		"""
+		if ts is None:
+			ts = int(time.time())
 		logger.error(f"An error occurred at {ts}: {error}\n{traceback.format_exc()}")
 	
 	"""
