@@ -67,6 +67,15 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
             3_000_000, 4_000_000, 5_000_000,
         ])
 
+    def test_adjacent_million_prices_are_not_merged(self):
+        self.assertEqual(parse_prices("2m 2m6"), [2_000_000, 2_600_000])
+        full_list = """13m9 2m5 4m4
+1m5 3m3 5m8
+5m8 2m9 2m4
+3m9 5m2 2m1
+2m 2m6"""
+        self.assertEqual(len(parse_prices(full_list)), 14)
+
     def test_stray_bo_prefix_before_price_does_not_shift_positions(self):
         self.assertEqual(parse_prices("14.5 14 68\nBo. 5.5"), [
             14_500_000, 14_000_000, 68_000_000, 5_500_000,

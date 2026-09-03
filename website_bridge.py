@@ -105,7 +105,7 @@ def parse_prices(text: str) -> list[int]:
         # Merge a deliberately spaced million fraction (`2m 8`, `2 tr 8`,
         # `1 triệu 250`) without merging separate values such as `2m 8m`.
         line = re.sub(
-            r"(\d+(?:[.,]\d+)?)\s*(?:m|tr|triệu|trieu)\.?\s+(\d{1,3})(?!\s*(?:m|k|tr|triệu|trieu)\b)",
+            r"(\d+(?:[.,]\d+)?)\s*(?:m|tr|triệu|trieu)\.?\s+(\d{1,3})(?!\s*(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)\b)",
             r"\1m\2",
             line,
             flags=re.I,
