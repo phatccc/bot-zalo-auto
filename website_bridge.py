@@ -243,11 +243,11 @@ def main_acc_from_text(text: str, fallback: str) -> str:
 def retry(action: Callable[[], Any], label: str, max_attempts: int = 4) -> Any:
     """Retry mọi thao tác ảnh tối đa max_attempts lần với back-off tăng dần.
 
-    Khoảng chờ: lần 2 → 5 s, lần 3 → 10 s, lần 4 → 20 s.
+    Khoảng chờ: lần 2 → 5 s, lần 3 → 15 s, lần 4 → 20 s.
     Bắt thêm RuntimeError để nested retry không bị wrap.
     """
     error = None
-    delays = [5, 10, 20]
+    delays = [5, 15, 20]
     for attempt in range(1, max_attempts + 1):
         try:
             return action()

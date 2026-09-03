@@ -141,6 +141,7 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
                 retry(bad_request, "ảnh test")
         self.assertEqual(len(attempts), 4)
         self.assertEqual(sleep.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 15, 20])
 
     def test_empty_or_invalid_download_is_rejected_before_upload(self):
         with self.assertRaises(ValueError):
