@@ -39,6 +39,24 @@ SALE_QUALIFIER_TOKENS = {
 MISSING_ACCOUNT_PRICE = 999_000_000
 
 
+def normalise_missing_status(line: str) -> str:
+    """Normalize multi-word unavailable statuses into a single slot token."""
+    line = re.sub(r"\b(?:đã|da)\s*[-_.]?\s*bay\b", "bay", line, flags=re.I)
+    line = re.sub(r"\b(?:đã|da)\s*[-_.]?\s*bán\b", "daban", line, flags=re.I)
+    return re.sub(r"\bbán\s*[-_.]?\s*rồi\b|\bban\s*[-_.]?\s*roi\b", "banroi", line, flags=re.I)
+
+
+def is_missing_status(segment: str) -> bool:
+    value = normalise_missing_status(segment).strip(".,;:()[]{} ").casefold()
+    return value in MISSING_ACCOUNT_TOKENS
+
+
+def is_unknown_price_slot(segment: str) -> bool:
+    """An arbitrary one-word status between price cells, such as `done`/`abc`."""
+    value = segment.strip(".,;:()[]{} ")
+    return bool(re.fullmatch(r"[A-Za-zÀ-ỹ]{1,24}", value))
+
+
 def parse_price_token(token: str) -> int | None:
     """Parse one accepted price token into VND without guessing prose."""
     value = token.lower().strip(".,;:()[]{}")
@@ -69,9 +87,7 @@ def parse_prices(text: str) -> list[int]:
     for line in price_text_without_owner(text).splitlines():
         # Sellers use both Vietnamese and English status words between prices.
         # Normalize multi-word status labels before splitting the price row.
-        line = re.sub(r"\b(?:đã|da)\s*[-_.]?\s*bay\b", "bay", line, flags=re.I)
-        line = re.sub(r"\b(?:đã|da)\s*[-_.]?\s*bán\b", "daban", line, flags=re.I)
-        line = re.sub(r"\bbán\s*[-_.]?\s*rồi\b|\bban\s*[-_.]?\s*roi\b", "banroi", line, flags=re.I)
+        line = normalise_missing_status(line)
         # Some sellers omit the final `)` in notes like `27 (VNG`; annotations
         # must not make that otherwise valid price disappear.
         line = re.sub(r"\([^)]*(?:\)|$)|\[[^]]*(?:\]|$)", " ", line).strip()
@@ -120,6 +136,59 @@ def parse_prices(text: str) -> list[int]:
         if price and price > 0:
             prices.append(price)
     return prices
+
+
+def parse_price_slots_with_unknowns(text: str) -> tuple[list[int | None], list[str]]:
+    """Keep one unknown, delimiter-separated word as a candidate price slot.
+
+    Unknown words are never made into prices here.  They become a placeholder
+    only later, when the resulting slot count exactly equals the album count.
+    """
+    slots: list[int | None] = []
+    unknown_labels: list[str] = []
+    for source_line in price_text_without_owner(text).splitlines():
+        strict = parse_prices(source_line)
+        if strict:
+            slots.extend(strict)
+            continue
+        if not re.search(r"[-|;/]", source_line):
+            continue
+        line_slots: list[int | None] = []
+        line_unknowns: list[str] = []
+        valid_line = True
+        real_price_count = 0
+        for segment in re.split(r"\s*[-|;/]\s*", source_line):
+            segment = segment.strip()
+            if not segment:
+                valid_line = False
+                break
+            values = parse_prices(segment)
+            if values:
+                line_slots.extend(values)
+                real_price_count += sum(value != MISSING_ACCOUNT_PRICE for value in values)
+            elif is_missing_status(segment):
+                line_slots.append(MISSING_ACCOUNT_PRICE)
+            elif is_unknown_price_slot(segment):
+                line_slots.append(None)
+                line_unknowns.append(segment.strip(".,;:()[]{} "))
+            else:
+                valid_line = False
+                break
+        # A line must contain at least one actual number.  This rejects normal
+        # prose such as `gửi - ae - xem` before it can become a fake batch.
+        if valid_line and real_price_count and line_unknowns:
+            slots.extend(line_slots)
+            unknown_labels.extend(line_unknowns)
+    return slots, unknown_labels
+
+
+def prices_for_image_count(text: str, image_count: int) -> tuple[list[int], list[str]]:
+    """Resolve arbitrary status words only if they make the album exact."""
+    strict = parse_prices(text)
+    slots, unknown_labels = parse_price_slots_with_unknowns(text)
+    if unknown_labels and len(slots) == image_count:
+        return [MISSING_ACCOUNT_PRICE if value is None else value for value in slots], unknown_labels
+    return strict, []
 
 
 def raised_price(price: int) -> int:
@@ -281,6 +350,8 @@ class PendingBatch:
     sender_name: str
     images: list[str] = field(default_factory=list)
     price_text: str | None = None
+    resolved_prices: list[int] = field(default_factory=list)
+    auto_placeholder_labels: list[str] = field(default_factory=list)
     return_callback: Callable[[list[tuple[bytes, str]], dict[str, Any]], None] | None = None
     reported_mismatch: str | None = None
 
@@ -308,7 +379,12 @@ class WebsiteBridge:
 
     def receive(self, mid, author_id, message, details, thread_id, thread_type, return_callback=None) -> None:
         urls = image_urls(message)
-        is_prices = isinstance(message, str) and bool(parse_prices(message))
+        if isinstance(message, str):
+            strict_prices = parse_prices(message)
+            candidate_slots, _ = parse_price_slots_with_unknowns(message)
+            is_prices = bool(strict_prices or candidate_slots)
+        else:
+            is_prices = False
         if not urls and not is_prices:
             return
         key = (str(author_id), str(thread_id))
@@ -320,7 +396,7 @@ class WebsiteBridge:
                 batch.sender_name = details.get("dName") or batch.sender_name
             if return_callback:
                 batch.return_callback = return_callback
-            prices = parse_prices(batch.price_text or "")
+            prices, placeholder_labels = prices_for_image_count(batch.price_text or "", len(batch.images))
             print(f"[BATCH] {key[0]}: {len(batch.images)} ảnh / {len(prices)} giá", flush=True)
             if len(batch.images) >= 2 and len(prices) >= 2 and len(batch.images) != len(prices):
                 signature = f"{len(batch.images)}:{len(prices)}"
@@ -333,6 +409,10 @@ class WebsiteBridge:
                     batch.reported_mismatch = signature
             if len(batch.images) < 2 or len(prices) < 2 or len(batch.images) != len(prices):
                 return
+            batch.resolved_prices = prices
+            batch.auto_placeholder_labels = placeholder_labels
+            if placeholder_labels:
+                print(f"[BATCH] Tự giữ {len(placeholder_labels)} vị trí chữ lạ thành 999m: {', '.join(placeholder_labels)}", flush=True)
             batch = self.batches.pop(key)
         self.executor.submit(self._import, batch)
 
@@ -494,10 +574,18 @@ class WebsiteBridge:
             print("[BATCH] Thiếu cấu hình Supabase/Cloudinary trong website.js.", flush=True)
             self.progress.record_issue("Thiếu cấu hình website", "Không thể cập nhật list vì website.js thiếu Supabase hoặc Cloudinary.")
             return
-        prices = [raised_price(value) for value in parse_prices(batch.price_text or "")]
+        raw_prices = batch.resolved_prices or parse_prices(batch.price_text or "")
+        prices = [raised_price(value) for value in raw_prices]
         base = str(self.settings["supabase_url"]).rstrip("/") + "/rest/v1"
         main_acc = main_acc_from_text(batch.price_text or "", batch.sender_name)
         batch_id = self.progress.start(len(prices), batch.sender_name, main_acc)
+        if batch.auto_placeholder_labels:
+            self.progress.record_issue(
+                "Tự thay ô chữ lạ thành 999m",
+                f"Đã giữ đúng thứ tự ảnh bằng cách thay: {', '.join(batch.auto_placeholder_labels)}. Chỉ áp dụng vì tổng số vị trí khớp đúng số ảnh.",
+                batch_id=batch_id,
+                severity="warning",
+            )
         self.progress.update_batch(batch_id, "Đang tìm owner web")
         try:
             owner = self.resolve_account_owner(base)

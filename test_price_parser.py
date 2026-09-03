@@ -5,7 +5,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 import requests
 
-from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, image_signature, parse_prices, priced_image, raised_price, retry, signature_similarity
+from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, image_signature, parse_prices, prices_for_image_count, priced_image, raised_price, retry, signature_similarity
 
 
 class PriceParserTests(unittest.TestCase):
@@ -72,6 +72,17 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
             14_500_000, 14_000_000, 68_000_000, 5_500_000,
         ])
         self.assertEqual(parse_prices("bỏ: 2m8\nbay"), [2_800_000, MISSING_ACCOUNT_PRICE])
+
+    def test_unknown_slot_is_resolved_only_when_album_count_is_exact(self):
+        prices, labels = prices_for_image_count("abc - 13m - 14m\n12m - xyz", 5)
+        self.assertEqual(prices, [
+            MISSING_ACCOUNT_PRICE, 13_000_000, 14_000_000,
+            12_000_000, MISSING_ACCOUNT_PRICE,
+        ])
+        self.assertEqual(labels, ["abc", "xyz"])
+        prices, labels = prices_for_image_count("13m - stranger - 14m", 4)
+        self.assertEqual(prices, [])
+        self.assertEqual(labels, [])
 
     def test_compact_badge_price(self):
         self.assertEqual(format_price_badge(12_500_000), "12m5")
