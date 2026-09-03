@@ -5,7 +5,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 import requests
 
-from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, image_signature, parse_prices, prices_for_image_count, priced_image, raised_price, retry, signature_similarity
+from website_bridge import MISSING_ACCOUNT_PRICE, format_price_badge, image_signature, parse_prices, prices_for_image_count, priced_image, raised_price, retry, signature_similarity, verified_image_content
 
 
 class PriceParserTests(unittest.TestCase):
@@ -127,7 +127,7 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
         output = Image.open(io.BytesIO(priced_image(source.getvalue(), 12_500_000)))
         self.assertEqual(output.size, (1920, 960))
 
-    def test_http_error_retries_three_times(self):
+    def test_http_error_retries_four_times(self):
         response = requests.Response()
         response.status_code = 400
         attempts = []
@@ -139,8 +139,17 @@ Sản xuất dc full Ẹc không mũ đinh - Ae có. Khách hú nha
         with patch("website_bridge.time.sleep") as sleep:
             with self.assertRaises(RuntimeError):
                 retry(bad_request, "ảnh test")
-        self.assertEqual(len(attempts), 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_empty_or_invalid_download_is_rejected_before_upload(self):
+        with self.assertRaises(ValueError):
+            verified_image_content(b"")
+        with self.assertRaises(ValueError):
+            verified_image_content(b"this is not an image")
+        raw = io.BytesIO()
+        Image.new("RGB", (16, 16), "white").save(raw, format="JPEG")
+        self.assertEqual(verified_image_content(raw.getvalue()), raw.getvalue())
 
     def test_image_signature_survives_centred_price_badge(self):
         source = Image.new("RGB", (900, 600), "black")

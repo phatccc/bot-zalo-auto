@@ -262,6 +262,24 @@ def retry(action: Callable[[], Any], label: str, max_attempts: int = 4) -> Any:
     raise RuntimeError(f"{label} thất bại sau {max_attempts} lần: {error}")
 
 
+def verified_image_content(content: bytes) -> bytes:
+    """Reject empty/truncated CDN responses before they reach Cloudinary.
+
+    Zalo's CDN can occasionally answer a successful HTTP request with an empty
+    body. Cloudinary then reports ``400: Empty file`` and retrying that same
+    byte string can never succeed. Verifying it here makes the *download*
+    retry instead, while keeping the image-to-price mapping unchanged.
+    """
+    if not content:
+        raise ValueError("Dữ liệu ảnh tải về rỗng")
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            image.verify()
+    except (OSError, ValueError) as error:
+        raise ValueError("Dữ liệu tải về không phải ảnh hợp lệ") from error
+    return content
+
+
 IMAGE_HASH_BITS = 16
 IMAGE_HASH_DISTANCE_LIMIT = 30
 
@@ -515,14 +533,22 @@ class WebsiteBridge:
         session = self._http()
 
         if prefetched_content is not None:
-            self.progress.update_item(batch_id, position, "Đang dán giá")
-            original = prefetched_content
+            try:
+                original = verified_image_content(prefetched_content)
+                self.progress.update_item(batch_id, position, "Đang dán giá")
+            except ValueError:
+                # A malformed prefetch must not be uploaded repeatedly. Fetch
+                # it again below so retry obtains fresh CDN bytes.
+                prefetched_content = None
         else:
+            original = None
+
+        if prefetched_content is None:
             def download_original():
                 self.progress.update_item(batch_id, position, "Đang tải và dán giá")
                 response = session.get(source_url, timeout=60)
                 response.raise_for_status()
-                return response.content
+                return verified_image_content(response.content)
 
             original = retry(download_original, f"Ảnh {title}")
         # Save a watermark-tolerant fingerprint of the original alongside the
@@ -651,7 +677,7 @@ class WebsiteBridge:
                 def _get():
                     r = session.get(url, timeout=60)
                     r.raise_for_status()
-                    return r.content
+                    return verified_image_content(r.content)
                 return url, retry(_get, f"Prefetch {url.split('/')[-1][:20]}")
             dl_futures = {dl_pool.submit(_fetch, source_url): position for position, source_url, price, title in tasks}
             for dl_future in as_completed(dl_futures):
