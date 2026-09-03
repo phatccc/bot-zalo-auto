@@ -104,13 +104,21 @@ def parse_prices(text: str) -> list[int]:
         line = re.sub(r"^\d+[.)]\s+(?=\d+(?:[.,]\d+)?(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)\b)", "", line, flags=re.I)
         # Merge a deliberately spaced million fraction (`2m 8`, `2 tr 8`,
         # `1 triệu 250`) without merging separate values such as `2m 8m`.
+        # The (?!\d) after \d{1,3} prevents backtracking: without it, the regex
+        # would try '13' in `25m 13m`, see the lookahead fail (next char is 'm'),
+        # then backtrack to match only '1' and pass the lookahead (next is '3m'),
+        # producing the invalid token `25m13m`.
         line = re.sub(
-            r"(\d+(?:[.,]\d+)?)\s*(?:m|tr|triệu|trieu)\.?\s+(\d{1,3})(?!\s*(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)\b)",
+            r"(\d+(?:[.,]\d+)?)\s*(?:m|tr|triệu|trieu)\.?\s+(\d{1,3})(?!\d)(?!\s*(?:m\d*|k|tr\d*|triệu\d*|trieu\d*)\b)",
             r"\1m\2",
             line,
             flags=re.I,
         )
-        line = re.sub(r"(\d+(?:[.,]\d+)?)\s+(m|k)\b", r"\1\2", line, flags=re.I)
+        # Merge an isolated unit suffix written with a space (`2 m`, `3 k`) into
+        # the preceding number.  The negative lookahead (?!\d) prevents stealing
+        # the `m` from the *next* price token — e.g. `25m 13m` must stay two
+        # separate values, not collapse to the unrecognised token `25m13m`.
+        line = re.sub(r"(\d+(?:[.,]\d+)?)\s+(m|k)\b(?!\d)", r"\1\2", line, flags=re.I)
         line = re.sub(r"(\d+(?:[.,]\d+)?)\s*(?:triệu|trieu|tr)\b", r"\1tr", line, flags=re.I)
         # Currency written immediately after the number is cosmetic: `2m5đ`.
         line = re.sub(r"(?<=\d)(?:vnđ|vnd|đồng|dong|đ)\b", "", line, flags=re.I)
@@ -232,20 +240,26 @@ def main_acc_from_text(text: str, fallback: str) -> str:
     return fallback[:200]
 
 
-def retry(action: Callable[[], Any], label: str) -> Any:
-    """Retry mọi thao tác ảnh 3 lần (kể cả 400/404); URL Zalo CDN có thể xuất hiện trễ."""
+def retry(action: Callable[[], Any], label: str, max_attempts: int = 4) -> Any:
+    """Retry mọi thao tác ảnh tối đa max_attempts lần với back-off tăng dần.
+
+    Khoảng chờ: lần 2 → 5 s, lần 3 → 10 s, lần 4 → 20 s.
+    Bắt thêm RuntimeError để nested retry không bị wrap.
+    """
     error = None
-    for attempt in range(1, 4):
+    delays = [5, 10, 20]
+    for attempt in range(1, max_attempts + 1):
         try:
             return action()
-        except (OSError, ValueError, requests.RequestException) as caught:
+        except (OSError, ValueError, RuntimeError, requests.RequestException) as caught:
             error = caught
-            if attempt < 3:
-                print(f"[BATCH] {label} lỗi ({caught.__class__.__name__}), thử lại lần {attempt + 1}/3 sau 5 giây.", flush=True)
-                time.sleep(5)
+            if attempt < max_attempts:
+                wait = delays[min(attempt - 1, len(delays) - 1)]
+                print(f"[BATCH] {label} lỗi ({caught.__class__.__name__}), thử lại lần {attempt + 1}/{max_attempts} sau {wait} giây.", flush=True)
+                time.sleep(wait)
                 continue
             break
-    raise RuntimeError(f"{label} thất bại sau 3 lần: {error}")
+    raise RuntimeError(f"{label} thất bại sau {max_attempts} lần: {error}")
 
 
 IMAGE_HASH_BITS = 16
@@ -265,9 +279,16 @@ def _difference_hash(image: Image.Image) -> str:
 
 
 def image_signature(content: bytes) -> str:
-    """Hash four border regions, intentionally excluding the centred price badge."""
-    with Image.open(io.BytesIO(content)) as source:
-        image = ImageOps.exif_transpose(source).convert("RGB")
+    """Hash four border regions, intentionally excluding the centred price badge.
+
+    Falls back to a plain SHA-256 hex when the bytes cannot be decoded as an
+    image (e.g. truncated download), so the account row is still written.
+    """
+    try:
+        with Image.open(io.BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source).convert("RGB")
+    except Exception:
+        return json.dumps({"v": 0, "sha256": hashlib.sha256(content).hexdigest()}, separators=(",", ":"))
     width, height = image.size
     # The bot places the price in the centre.  Top, bottom, and side strips stay
     # stable even when the same account image arrives again with a price pasted on.
@@ -528,7 +549,8 @@ class WebsiteBridge:
                 # Unsigned presets often reject `overwrite`; Cloudinary already
                 # handles a duplicate public ID according to the preset policy.
                 data={"upload_preset": self.settings["cloudinary_upload_preset"], "public_id": f"zalo_bot/{title}"},
-                timeout=90,
+                # 180 s covers large 4K images on a slow VPS connection.
+                timeout=180,
             )
             if not response.ok:
                 try:
