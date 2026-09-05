@@ -407,6 +407,9 @@ class WebsiteBridge:
         self.render_executor = ThreadPoolExecutor(max_workers=2)
         self.progress = progress or ProgressTracker()
         self._http_local = threading.local()
+        # Tracks batches currently being imported to prevent duplicate submissions
+        # caused by Zalo firing the same album event twice.
+        self.processing_batches: set[tuple[str, str]] = set()
 
     def _http(self) -> requests.Session:
         """One persistent connection pool per worker thread."""
@@ -448,12 +451,16 @@ class WebsiteBridge:
                     batch.reported_mismatch = signature
             if len(batch.images) < 2 or len(prices) < 2 or len(batch.images) != len(prices):
                 return
+            if key in self.processing_batches:
+                print(f"[BATCH] {key[0]}: batch đang được xử lý, bỏ qua lần gửi trùng.", flush=True)
+                return
             batch.resolved_prices = prices
             batch.auto_placeholder_labels = placeholder_labels
             if placeholder_labels:
                 print(f"[BATCH] Tự giữ {len(placeholder_labels)} vị trí chữ lạ thành 999m: {', '.join(placeholder_labels)}", flush=True)
             batch = self.batches.pop(key)
-        self.executor.submit(self._import, batch)
+            self.processing_batches.add(key)
+        self.executor.submit(self._import, batch, key)
 
     def _headers(self) -> dict[str, str]:
         key = self.settings.get("supabase_service_key", "")
@@ -616,11 +623,13 @@ class WebsiteBridge:
         self.progress.update_item(batch_id, position, "Hoàn tất")
         return rendered
 
-    def _import(self, batch: PendingBatch) -> None:
+    def _import(self, batch: PendingBatch, key: tuple[str, str] | None = None) -> None:
         required = ("supabase_url", "supabase_service_key", "cloudinary_cloud_name", "cloudinary_upload_preset")
-        if any(not self.settings.get(key) for key in required):
+        if any(not self.settings.get(k) for k in required):
             print("[BATCH] Thiếu cấu hình Supabase/Cloudinary trong website.js.", flush=True)
             self.progress.record_issue("Thiếu cấu hình website", "Không thể cập nhật list vì website.js thiếu Supabase hoặc Cloudinary.")
+            if key is not None:
+                self.processing_batches.discard(key)
             return
         raw_prices = batch.resolved_prices or parse_prices(batch.price_text or "")
         prices = [raised_price(value) for value in raw_prices]
@@ -728,6 +737,8 @@ class WebsiteBridge:
                     failed=finished_count - len(completed),
                 )
         returned = [completed[position] for position, _, _, _ in tasks if position in completed]
+        if key is not None:
+            self.processing_batches.discard(key)
         if not returned:
             self.progress.update_batch(batch_id, "Thất bại: không có ảnh cập nhật", success=0, failed=len(tasks), done=True)
             self.progress.record_issue("Batch không cập nhật được ảnh nào", "Toàn bộ ảnh trong list thất bại. Xem lỗi từng ảnh để xử lý.", batch_id=batch_id)
